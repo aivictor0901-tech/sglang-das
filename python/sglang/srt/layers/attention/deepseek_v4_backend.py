@@ -165,9 +165,15 @@ T = TypeVar("T", bound=Optional[torch.Tensor])
 
 
 def _should_use_sparse_prefill(q: torch.Tensor, forward_batch: ForwardBatch) -> bool:
-    return not _is_sm120 and not dsa_use_prefill_cp(forward_batch) and (
-        q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
-        or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+    sparse_prefill_enabled = envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+    explicit_cp_override = (
+        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.is_set()
+        and sparse_prefill_enabled
+    )
+    return (
+        not _is_sm120
+        and (not dsa_use_prefill_cp(forward_batch) or explicit_cp_override)
+        and (q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD or sparse_prefill_enabled)
     )
 
 
@@ -2417,6 +2423,48 @@ class DeepseekV4AttnBackend(
             assert seq_lens_cpu is not None
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             assert extend_seq_lens_cpu is not None
+
+            query_seq_lens = None
+            query_positions = None
+            if dsa_use_prefill_cp(forward_batch):
+                cp_size = get_parallel().attn_cp_size
+                cp_rank = get_parallel().attn_cp_rank
+
+                # Interleave CP owns global flattened rows rank::cp_size. The
+                # sparse-prefill combiner must loop over those local rows, not
+                # the original global extend lengths. Physical padding is
+                # appended to the last request before sharding.
+                padded_extend_lens = [int(x) for x in extend_seq_lens_cpu]
+                padded_total = q_flat.shape[0] * cp_size
+                # Both CP-v2 and legacy DSA round-robin call
+                # DSV4AttnMetadata.apply_cp_reindex() before attention, so
+                # positions_casual is already rank-local in both paths.
+                query_positions = core_attn_metadata.positions_casual[
+                    : q_flat.shape[0]
+                ].contiguous()
+                assert query_positions.shape[0] == q_flat.shape[0]
+                pad_len = padded_total - sum(padded_extend_lens)
+                assert pad_len >= 0
+                if pad_len:
+                    padded_extend_lens[-1] += pad_len
+
+                local_query_lens = []
+                global_start = 0
+                for query_len in padded_extend_lens:
+                    global_end = global_start + query_len
+                    first = global_start + ((cp_rank - global_start) % cp_size)
+                    local_len = (
+                        0
+                        if first >= global_end
+                        else 1 + (global_end - 1 - first) // cp_size
+                    )
+                    local_query_lens.append(local_len)
+                    global_start = global_end
+                assert sum(local_query_lens) == q_flat.shape[0]
+                query_seq_lens = torch.tensor(
+                    local_query_lens, dtype=torch.int32, device=q_flat.device
+                )
+
             total_swa = sum(
                 min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
                 for seq_len, extend_len in zip(
@@ -2436,6 +2484,8 @@ class DeepseekV4AttnBackend(
                 num_qo_tokens=q_flat.shape[0],
                 max_seq_len=int(seq_lens_cpu.max().item()),
                 total_swa=total_swa,
+                query_seq_lens=query_seq_lens,
+                query_positions=query_positions,
             )
             self.forward_metadata.sparse_prefill_cache = cache
 
