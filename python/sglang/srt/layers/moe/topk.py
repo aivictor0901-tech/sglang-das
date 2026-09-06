@@ -2308,6 +2308,7 @@ def _post_process_topk_ids(
     capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
     recorder_topk_ids = None
     _fold_pad_into_append = False
+    fuse_dsv4_deepep_padded_rows = False
     # HCU W8A8 deployments can select DeepGEMM through the legacy env while
     # the global runner backend remains AUTO, so recognize both selectors.
     skip_deepep_padded_tokens = (
@@ -2388,7 +2389,20 @@ def _post_process_topk_ids(
                 and use_per_rank_shared_slots
                 and remap_info is None
             )
-        if not skip_deepep_padded_tokens and not _fold_pad_into_append:
+            fuse_dsv4_deepep_padded_rows = (
+                envs.SGLANG_DSV4_FUSED_DEEPEP_PREP.get()
+                and not _skip_hip_pad_mask
+                and num_token_non_padded is not None
+                and num_fused_shared_experts == 0
+                and remap_info is None
+                and _can_fuse_padded_region(topk_ids)
+                and _can_fuse_padded_region(topk_weights)
+            )
+        if (
+            not skip_deepep_padded_tokens
+            and not _fold_pad_into_append
+            and not fuse_dsv4_deepep_padded_rows
+        ):
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
@@ -2491,7 +2505,14 @@ def _post_process_topk_ids(
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.
-        _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+        if fuse_dsv4_deepep_padded_rows:
+            from lightop.moe import dsv4_mask_padded_topk_rows_
+
+            dsv4_mask_padded_topk_rows_(
+                topk_ids, topk_weights, num_token_non_padded
+            )
+        else:
+            _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
 
     return topk_ids, topk_weights, recorder_topk_ids
 

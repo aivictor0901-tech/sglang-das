@@ -844,6 +844,8 @@ class Envs:
 
     # Explicit-output DSV4 LightOp operator; opt in explicitly.
     SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED = EnvBool(False)
+    # Fuse DSV4 DeepEP padded-row masking and INT8 dispatch preparation.
+    SGLANG_DSV4_FUSED_DEEPEP_PREP = EnvBool(False)
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
