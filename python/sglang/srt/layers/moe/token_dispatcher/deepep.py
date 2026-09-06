@@ -602,15 +602,44 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_output: TopKOutput,
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(torch.int64)
         if use_groupgemm:
             if _use_fp8_w8a8_moe:
+                topk_ids = topk_ids.to(torch.int64)
                 hidden_states = per_token_quant_fp8(hidden_states)
             elif _use_marlin_w16a16_moe:
-                pass
+                topk_ids = topk_ids.to(torch.int64)
             else:
-                hidden_states = per_token_quant_int8(hidden_states)
+                if (
+                    envs.SGLANG_DSV4_FUSED_DEEPEP_PREP.get()
+                    and topk_ids.dtype == torch.int32
+                ):
+                    from lightop.moe import (
+                        dsv4_quantize_int8_with_topk_ids_out,
+                    )
+
+                    hidden_states_q = torch.empty_like(
+                        hidden_states, dtype=torch.int8
+                    )
+                    scales = torch.empty(
+                        hidden_states.shape[:-1] + (1,),
+                        device=hidden_states.device,
+                        dtype=torch.float32,
+                    )
+                    topk_ids_i64 = torch.empty_like(topk_ids, dtype=torch.int64)
+                    dsv4_quantize_int8_with_topk_ids_out(
+                        hidden_states,
+                        topk_ids,
+                        hidden_states_q,
+                        scales,
+                        topk_ids_i64,
+                    )
+                    hidden_states = (hidden_states_q, scales)
+                    topk_ids = topk_ids_i64
+                else:
+                    topk_ids = topk_ids.to(torch.int64)
+                    hidden_states = per_token_quant_int8(hidden_states)
         else:
+            topk_ids = topk_ids.to(torch.int64)
             backend = get_moe_runner_backend()
             # BF16 dispatch is needed when:
             #   - cutlass backend (uses different kernel)
