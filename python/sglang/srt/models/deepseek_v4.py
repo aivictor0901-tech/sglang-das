@@ -219,6 +219,29 @@ def _get_mhc_ops() -> MhcOps:
 logger = logging.getLogger(__name__)
 
 
+class _DSparkMeanHiddenStatePacker(AuxHiddenStatePacker):
+    """Model-local mean-out extension; the shared packer contract is unchanged."""
+
+    def append_completed_mean(self, completed: torch.Tensor) -> torch.Tensor:
+        feature_size = int(completed.shape[-1])
+        if self._buffer is None:
+            self._feature_size = feature_size
+            self._buffer = completed.new_empty(
+                (completed.shape[0], feature_size * self._num_captures)
+            )
+        start = self._idx * self._feature_size
+        destination = self._buffer[:, start : start + self._feature_size]
+
+        # The environment variable is the only SGLang-side dispatch gate.
+        # LightOp owns validation of the operator ABI and target workload.
+        from lightop import op as lightop_op
+
+        lightop_op.dspark_mean_pack_out(completed, destination)
+
+        self._idx += 1
+        return destination
+
+
 def _hcu_q_rms_int8_enabled() -> bool:
     # Cache this result on the layer at construction, not on every token batch.
     # Serving role/mode and kernel size specialization are not feature gates.
@@ -3435,7 +3458,11 @@ class DeepseekV4Model(nn.Module):
             )
         use_packed_pd_aux = capture_dspark and self.pp_group.world_size == 1
         pd_aux_hidden_states: AuxHiddenStateAccumulator = (
-            AuxHiddenStatePacker(len(dspark_layers_to_capture))
+            (
+                _DSparkMeanHiddenStatePacker(len(dspark_layers_to_capture))
+                if envs.SGLANG_DSV4_FUSED_DSPARK_MEAN_PACK.get()
+                else AuxHiddenStatePacker(len(dspark_layers_to_capture))
+            )
             if use_packed_pd_aux
             else list(incoming_pd_aux_hidden_states)
         )
@@ -3497,8 +3524,13 @@ class DeepseekV4Model(nn.Module):
                         )
                     else:
                         completed = hidden_states
-                    captured_hidden = completed.mean(dim=1)
-                    pd_aux_hidden_states.append(captured_hidden)
+                    if isinstance(pd_aux_hidden_states, _DSparkMeanHiddenStatePacker):
+                        captured_hidden = pd_aux_hidden_states.append_completed_mean(
+                            completed
+                        )
+                    else:
+                        captured_hidden = completed.mean(dim=1)
+                        pd_aux_hidden_states.append(captured_hidden)
                     local_dspark_aux_hidden_states.append(captured_hidden)
             if use_fused and last_layer is not None:
                 hidden_states = last_layer.hc_post(

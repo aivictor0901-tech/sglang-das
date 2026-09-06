@@ -847,6 +847,8 @@ class Envs:
     # Experimental HCU eager Q RMSNorm + INT8 quantization, enabled only by env.
     # Independent of the historical SGLANG_USE_FUSED_RMS_QUANT pathway.
     SGLANG_DSV4_FUSED_Q_RMS_INT8_QUANT = EnvBool(False)
+    # Write completed DSpark means directly into the existing packed aux buffer.
+    SGLANG_DSV4_FUSED_DSPARK_MEAN_PACK = EnvBool(False)
     # Preserve legacy RR CP communication; fuse only reorder + JIT-contract KV store.
     SGLANG_DSV4_FUSE_CP_KV_REORDER_STORE = EnvBool(False)
     SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
