@@ -104,6 +104,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_round_robin_rank_major,
     cp_all_gather_rerange_finish,
     cp_all_gather_rerange_launch,
     cp_all_gather_rerange_output,
@@ -263,6 +264,29 @@ def _get_hcu_q_rms_int8_ops():
         get_fused_op_backend,
         supports_strided_input,
     )
+
+
+@functools.cache
+def _get_cp_rank_major_kv_store_ops():
+    """Resolve optional library ABI before any KV collective is launched."""
+    try:
+        from lightop import kvcache
+
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+    except (ImportError, OSError) as exc:
+        logger.warning("DSV4 CP KV fusion unavailable; using original path: %s", exc)
+        return None
+    store = getattr(
+        kvcache, "quantize_nope_fp8_rope_bf16_pack_store_cp_rank_major", None
+    )
+    supports = getattr(
+        kvcache, "supports_quantize_nope_fp8_rope_bf16_pack_store_cp_rank_major", None
+    )
+    if not callable(store) or not callable(supports):
+        return None
+    return store, supports, DeepseekV4AttnBackend
 
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
@@ -959,10 +983,105 @@ class MQALayer(MqaAttentionBase):
             _is_hip and not _is_hcu and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
         )
         self._use_hcu_q_rms_int8_quant = _hcu_q_rms_int8_enabled()
+        self._use_cp_kv_reorder_store = (
+            envs.SGLANG_DSV4_FUSE_CP_KV_REORDER_STORE.get()
+        )
 
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
         # has no effect here -- the fused path is on by default.
+
+    def _prepare_cp_rank_major_kv_store(self, kv, forward_batch, attn_backend):
+        """Return a prepared JIT-compatible store, or pre-collective fallback.
+
+        This is an algorithm/ABI check, not a serving-role or kernel-size gate.
+        Shape, stride, dtype, device and architecture support belong to LightOp.
+        Only existing host metadata and tensor metadata are read here.
+        """
+        if not self._use_cp_kv_reorder_store:
+            return None
+        if (
+            not self.dsa_enable_prefill_cp
+            or not dsa_use_prefill_cp(forward_batch)
+            or is_cp_v2_active(forward_batch)
+            or not is_dsa_prefill_cp_round_robin_split()
+            or getattr(forward_batch, "spec_info", None) is not None
+            or getattr(forward_batch, "tbo_parent_token_range", None) is not None
+            or getattr(forward_batch, "_cp_prefetch_comm_stream", None) is not None
+            or not envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get()
+        ):
+            return None
+        # No new opaque native call is introduced into an unregistered compiled
+        # graph path. Standalone native CUDA/HIP graph correctness is separate.
+        if (
+            torch.compiler.is_compiling()
+            or get_is_capture_mode()
+            or is_in_breakable_cuda_graph()
+            or get_tc_piecewise_forward_context() is not None
+        ):
+            return None
+        ops = _get_cp_rank_major_kv_store_ops()
+        if ops is None:
+            return None
+        store, supports, backend_type = ops
+        if type(attn_backend) is not backend_type:
+            return None
+        pool = attn_backend.token_to_kv_pool
+        if pool.is_bf16_attention_kv_cache:
+            return None
+        # The ordinary backend stores global locations. Only reuse its already
+        # cached mapping here: do not add a translation kernel to failed probes.
+        core = getattr(attn_backend.forward_metadata, "core_attn_metadata", None)
+        cached_loc = getattr(core, "swa_out_cache_loc", None)
+        global_rows = forward_batch.out_cache_loc.shape[0]
+        if cached_loc is None or cached_loc.shape[0] != global_rows:
+            return None
+        cp_size = get_parallel().attn_cp_size
+        if cp_size <= 1 or kv.shape[0] * cp_size != global_rows:
+            return None
+        # Legacy RR requires equally sized physical shards. Unknown or padded
+        # logical lengths fall back; a default None _original_num_tokens does
+        # NOT mean padding and must not reject normal unpadded ForwardBatch.
+        lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if (
+            not isinstance(lengths, (list, tuple))
+            or any(type(length) is not int or length < 0 for length in lengths)
+            or sum(lengths) != global_rows
+        ):
+            return None
+        original_rows = getattr(forward_batch, "_original_num_tokens", None)
+        if original_rows is not None and original_rows != global_rows:
+            return None
+        swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
+        cache = pool.get_swa_raw_buffer(self.layer_id)
+        page_size = pool.swa_kv_pool.page_size
+        # supports receives LOCAL K, before allocating the global gather output.
+        # It must be metadata-only and returns False for unsupported old binaries.
+        if not supports(kv, cache, swa_loc, page_size, cp_size):
+            return None
+        return store, cache, swa_loc, page_size, cp_size
+
+    def _gather_and_store_cp_kv(self, kv, forward_batch, attn_backend):
+        """Preserve one collective and the cache-based non-unified consumer."""
+        kv = kv.contiguous()
+        prepared = self._prepare_cp_rank_major_kv_store(kv, forward_batch, attn_backend)
+        if prepared is None:
+            kv = cp_materialize_global_token_order(
+                kv, forward_batch, torch.cuda.current_stream()
+            )
+            attn_backend.store_cache(
+                layer_id=self.layer_id, swa_k=kv, forward_batch=forward_batch
+            )
+            return kv
+        store, cache, swa_loc, page_size, cp_size = prepared
+        rank_major = cp_all_gather_round_robin_rank_major(kv, cp_size)
+        # No catch/retry after collective or mutation; a native failure surfaces.
+        # Only the source row is mapped; global swa_loc and PP layer mapping stay
+        # unchanged. Native preserves JIT eps1e-4/max224/generic-FN/7scale bytes.
+        store(rank_major, cache, swa_loc, page_size, cp_size)
+        # This branch's attention uses the written paged cache, not current BF16
+        # K. The existing kv=None sentinel keeps save_kv_cache=False downstream.
+        return None
 
     def _get_npu_rope_position_cache(
         self, positions: torch.Tensor, dtype: torch.dtype, inverse: bool = False
@@ -1672,16 +1791,7 @@ class MQALayer(MqaAttentionBase):
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
-                kv = cp_materialize_global_token_order(
-                    kv.contiguous(),
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
-                attn_backend.store_cache(
-                    layer_id=self.layer_id,
-                    swa_k=kv,
-                    forward_batch=forward_batch,
-                )
+                kv = self._gather_and_store_cp_kv(kv, forward_batch, attn_backend)
             else:
                 self._compute_kv_to_cache(
                     x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a

@@ -336,6 +336,33 @@ def cp_all_gather_rerange_finish(handle):
     )
 
 
+def cp_all_gather_round_robin_rank_major(input_tensor, cp_size):
+    """Gather legacy RR shards without materializing global token order.
+
+    The allocator, collective, group and current stream are the same as the
+    RR branch of cp_all_gather_rerange_output. Consumers MUST explicitly map
+    global token g to source row (g % cp_size) * local_rows + g // cp_size.
+    This helper does not change cp_materialize_global_token_order's contract.
+    """
+    from sglang.srt.layers.attention.dsa.utils import (
+        is_dsa_prefill_cp_round_robin_split,
+    )
+
+    if not is_dsa_prefill_cp_round_robin_split():
+        raise ValueError("Rank-major CP gather requires legacy round-robin layout")
+    with use_symmetric_memory(
+        get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
+    ):
+        output_tensor = input_tensor.new_empty(
+            (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
+        )
+    attn_cp_all_gather_into_tensor(
+        output_tensor,
+        input_tensor,
+    )
+    return output_tensor
+
+
 def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     """
     # for in-seq-split
@@ -368,16 +395,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     )
 
     if is_dsa_prefill_cp_round_robin_split():
-        with use_symmetric_memory(
-            get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
-        ):
-            output_tensor = input_tensor.new_empty(
-                (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
-            )
-        attn_cp_all_gather_into_tensor(
-            output_tensor,
-            input_tensor,
-        )
+        output_tensor = cp_all_gather_round_robin_rank_major(input_tensor, cp_size)
         out_shape = output_tensor.shape
         output_tensor = (
             output_tensor.view(cp_size, -1, *out_shape[1:])
