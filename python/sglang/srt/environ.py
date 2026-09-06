@@ -842,6 +842,9 @@ class Envs:
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("kernel")  # HCU override
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
 
+    # Explicit-output DSV4 LightOp operator; opt in explicitly.
+    SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED = EnvBool(False)
+
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
     # Experimental HCU eager Q RMSNorm + INT8 quantization, enabled only by env.
