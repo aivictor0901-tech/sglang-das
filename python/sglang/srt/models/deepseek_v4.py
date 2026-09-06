@@ -386,6 +386,21 @@ def _get_cp_rank_major_kv_store_ops():
     return store, supports, DeepseekV4AttnBackend
 
 
+@functools.cache
+def _get_k_norm_rope_out_ops():
+    """Optional library ABI; the library owns input specialization and output."""
+    try:
+        from lightop import attention
+    except (ImportError, OSError) as exc:
+        logger.warning("DSV4 K norm/RoPE fusion unavailable; using original path: %s", exc)
+        return None
+    supports = getattr(attention, "supports_fused_k_norm_rope_sglang", None)
+    kernel = getattr(attention, "fused_k_norm_rope_sglang", None)
+    if not callable(supports) or not callable(kernel):
+        return None
+    return supports, kernel
+
+
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
 
@@ -1083,6 +1098,7 @@ class MQALayer(MqaAttentionBase):
         self._use_cp_kv_reorder_store = (
             envs.SGLANG_DSV4_FUSE_CP_KV_REORDER_STORE.get()
         )
+        self._use_k_norm_rope_out = envs.SGLANG_DSV4_FUSED_K_NORM_ROPE_OUT.get()
 
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
@@ -1375,6 +1391,37 @@ class MQALayer(MqaAttentionBase):
             positions=positions,
         )
 
+    def _try_k_norm_rope_out(self, kv, positions):
+        """Read-only K view -> independent dense output, or pre-launch fallback.
+
+        No role, fixed shape, stride or architecture feature gates are added.
+        LightOp handles specialization, metadata validation and output ownership.
+        The original complex frequency table is passed unchanged; the library
+        owns its zero-copy real view and must preserve both BF16 rounding points.
+        """
+        if not self._use_k_norm_rope_out:
+            return None
+        if (
+            torch.compiler.is_compiling()
+            or get_is_capture_mode()
+            or is_in_breakable_cuda_graph()
+            or get_tc_piecewise_forward_context() is not None
+        ):
+            return None
+        ops = _get_k_norm_rope_out_ops()
+        if ops is None:
+            return None
+        supports, kernel = ops
+        weight = self.kv_norm.weight.data
+        if not supports(kv, weight, self.eps, self.freqs_cis, positions):
+            return None
+        # No contiguous/copy before the call and no retry after native mutation.
+        # This is a new out-of-place API, never an in-place edit of shared QKV.
+        output = kernel(kv, weight, self.eps, self.freqs_cis, positions)
+        if output is None:
+            raise RuntimeError("LightOp K norm/RoPE out API returned no output")
+        return output
+
     def _compute_kv_bf16(
         self,
         x: torch.Tensor,
@@ -1386,6 +1433,9 @@ class MQALayer(MqaAttentionBase):
             kv = qkv_a[..., self.q_lora_rank :]
         else:
             kv, _ = self.wkv(x)
+        fused_kv = self._try_k_norm_rope_out(kv, positions)
+        if fused_kv is not None:
+            return fused_kv
         kv = kv.contiguous()
         fused_norm_rope_inplace(
             kv,

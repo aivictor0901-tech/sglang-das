@@ -851,6 +851,8 @@ class Envs:
     SGLANG_DSV4_FUSED_DSPARK_MEAN_PACK = EnvBool(False)
     # Preserve legacy RR CP communication; fuse only reorder + JIT-contract KV store.
     SGLANG_DSV4_FUSE_CP_KV_REORDER_STORE = EnvBool(False)
+    # Read K from shared QKV storage and write a separate dense norm/RoPE result.
+    SGLANG_DSV4_FUSED_K_NORM_ROPE_OUT = EnvBool(False)
     SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
     # Unified KV wired the fused qk-norm-rope kernel to decode only, so MTP
     # target-verify kept running the norm+RoPE as separate kernels. Set to 0 to
