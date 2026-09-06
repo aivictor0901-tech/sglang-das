@@ -844,6 +844,9 @@ class Envs:
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
+    # Experimental HCU eager Q RMSNorm + INT8 quantization, enabled only by env.
+    # Independent of the historical SGLANG_USE_FUSED_RMS_QUANT pathway.
+    SGLANG_DSV4_FUSED_Q_RMS_INT8_QUANT = EnvBool(False)
     SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
     # Unified KV wired the fused qk-norm-rope kernel to decode only, so MTP
     # target-verify kept running the norm+RoPE as separate kernels. Set to 0 to

@@ -546,7 +546,29 @@ class ColumnParallelLinear(LinearBase):
         residual: Optional[torch.Tensor] = None,
         update_hd: Optional[bool] = True,
         input_quant_args=None,
+        *,
+        prequantized_int8: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
+        if prequantized_int8 is not None:
+            # Explicit opt-in; do not change the legacy RMS-quant env gate.
+            if any(arg is not None for arg in (rms_weight, residual, input_quant_args)):
+                raise ValueError("prequantized_int8 cannot be combined with RMS arguments")
+            apply_prequantized = getattr(self.quant_method, "apply_prequantized", None)
+            if not callable(apply_prequantized):
+                raise NotImplementedError(
+                    "This quantization method does not accept prequantized INT8 input"
+                )
+            bias = self.bias if not self.skip_bias_add else None
+            output_parallel = apply_prequantized(
+                self, input_, prequantized_int8, bias=bias
+            )
+            if self.gather_output:
+                output = tensor_model_parallel_all_gather(output_parallel)
+            else:
+                output = output_parallel
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
+
         if _use_fused_rms_quant and (
             rms_weight is not None or input_quant_args is not None
         ):

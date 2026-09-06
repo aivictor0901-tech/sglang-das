@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
+import math
 import time
 from contextlib import contextmanager, nullcontext
 from typing import (
@@ -215,6 +216,54 @@ def _get_mhc_ops() -> MhcOps:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _hcu_q_rms_int8_enabled() -> bool:
+    # Cache this result on the layer at construction, not on every token batch.
+    # Serving role/mode and kernel size specialization are not feature gates.
+    return _is_hcu and envs.SGLANG_DSV4_FUSED_Q_RMS_INT8_QUANT.get()
+
+
+@functools.cache
+def _get_hcu_q_rms_int8_ops():
+    """Optional, cached capability lookup; never called with the new flag off."""
+    try:
+        import inspect
+
+        import lightop
+
+        from sglang.kernels.fused_op import get_fused_op_backend
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+        from sglang.srt.layers.layernorm import _has_vllm_rms_norm
+        from sglang.srt.layers.quantization.slimquant_w4a8 import (
+            SlimQuantW4A8Int8LinearMethod,
+        )
+
+        kernel = getattr(lightop, "rms_norm_dynamic_per_token_quant_sglang", None)
+        native_kernel = getattr(
+            getattr(lightop, "op", None),
+            "rms_norm_dynamic_per_token_quant_sglang",
+            None,
+        )
+    except (ImportError, OSError) as exc:
+        logger.warning("DSV4 Q RMS INT8 fusion unavailable; using original path: %s", exc)
+        return None
+    if not callable(kernel) or not callable(native_kernel) or not _has_vllm_rms_norm:
+        logger.warning("DSV4 Q RMS INT8 fusion unavailable; missing compatible RMS kernel")
+        return None
+    try:
+        supports_strided_input = "allow_strided_input" in inspect.signature(kernel).parameters
+    except (TypeError, ValueError):
+        # An old/uninspectable wrapper keeps the existing contiguous C0 API.
+        supports_strided_input = False
+    return (
+        kernel,
+        SlimQuantW4A8Int8LinearMethod,
+        is_batch_invariant_mode_enabled,
+        get_fused_op_backend,
+        supports_strided_input,
+    )
+
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
@@ -909,6 +958,7 @@ class MQALayer(MqaAttentionBase):
         self.use_fused_qk_norm_rope = (
             _is_hip and not _is_hcu and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
         )
+        self._use_hcu_q_rms_int8_quant = _hcu_q_rms_int8_enabled()
 
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
@@ -944,13 +994,125 @@ class MQALayer(MqaAttentionBase):
             q, _ = self.wq_a(x)
         return self.q_norm(q)
 
+    def _try_hcu_q_rms_int8_quant(self, q_lora, forward_batch):
+        """Return (BF16 norm, (INT8, FP32 scale)), or pre-launch fallback.
+
+        Env-controlled eager HCU WQ-B SlimQuant strategy 3. LightOp owns all
+        size/layout specialization. No GEMM/collective is fused or bypassed.
+        """
+        if not self._use_hcu_q_rms_int8_quant or not _is_hcu:
+            return None
+        if (
+            torch.compiler.is_compiling()
+            or get_is_capture_mode()
+            or is_in_breakable_cuda_graph()
+            or get_tc_piecewise_forward_context() is not None
+            or torch.is_grad_enabled()
+        ):
+            return None
+        if (
+            type(q_lora) is not torch.Tensor
+            or not q_lora.is_cuda
+            or q_lora.dtype != torch.bfloat16
+            or q_lora.dim() != 2
+            or q_lora.shape[0] == 0
+            or q_lora.shape[1] == 0
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        ops = _get_hcu_q_rms_int8_ops()
+        if ops is None:
+            return None
+        (
+            kernel,
+            quant_method_type,
+            batch_invariant_enabled,
+            forced_norm_backend,
+            supports_strided_input,
+        ) = ops
+        norm, linear = self.q_norm, self.wq_b
+        if (
+            batch_invariant_enabled()
+            or forced_norm_backend() is not None
+            or type(norm) is not RMSNorm
+            or type(linear) is not ColumnParallelLinear
+            or type(linear.quant_method) is not quant_method_type
+            or linear.quant_method.w8a8_strategy != 3
+            or getattr(norm._forward_method, "__func__", None) is not RMSNorm.forward_hip
+            or norm.variance_size_override is not None
+            or norm.cast_x_before_out_mul
+            or norm.override_orig_dtype is not None
+            or getattr(norm, "x_pad_to_multiple", 0) != 0
+            or not math.isfinite(norm.variance_epsilon)
+            or norm.variance_epsilon <= 0
+            or norm._forward_pre_hooks
+            or norm._forward_hooks
+            or linear._forward_pre_hooks
+            or linear._forward_hooks
+        ):
+            return None
+        # Validate original operands before launching the new kernel. The
+        # explicit quantization-method entry validates only its produced pair.
+        hidden_size = q_lora.shape[1]
+        weight, linear_weight, weight_scale = norm.weight, linear.weight, linear.weight_scale
+        if (
+            norm.hidden_size != hidden_size
+            or linear.input_size != hidden_size
+            or weight.shape != (hidden_size,)
+            or weight.dtype != q_lora.dtype
+            or weight.device != q_lora.device
+            or not weight.is_contiguous()
+            or weight.data_ptr() % 16 != 0
+            or linear_weight.shape != (linear.output_size_per_partition, hidden_size)
+            or linear_weight.dtype != torch.int8
+            or linear_weight.device != q_lora.device
+            or not linear_weight.is_contiguous()
+            or weight_scale.shape != (linear.output_size_per_partition, 1)
+            or weight_scale.dtype != torch.float32
+            or weight_scale.device != q_lora.device
+            or not weight_scale.is_contiguous()
+        ):
+            return None
+
+        # A new wrapper owns specialization and any necessary contiguous copy.
+        # Old wrappers keep C0; never send an unsupported keyword to them.
+        q_input = q_lora if supports_strided_input else q_lora.contiguous()
+        kernel_kwargs = {"allow_strided_input": True} if supports_strided_input else {}
+        if not supports_strided_input and q_input.data_ptr() % 16 != 0:
+            return None
+        # Even when q_input is strided, retain a distinct dense BF16 output.
+        q_norm = torch.empty_like(q_input, memory_format=torch.contiguous_format)
+        assert q_norm.is_contiguous(), "Q RMSQuant norm_output must be dense"
+        # The _sglang kernel rounds to BF16 before absmax/INT8 quantization.
+        # Keep BF16 for the indexer, and never modify the packed QKV input.
+        # Kernel/runtime exceptions intentionally propagate: no post-launch fallback.
+        q_int8, q_scales = kernel(
+            input=q_input,
+            weight=weight,
+            epsilon=norm.variance_epsilon,
+            quant_dtype=torch.int8,
+            residual=None,
+            update_input=False,
+            limit=-1.0,
+            smooth_scale=None,
+            norm_output=q_norm,
+            clamp_norm_output=False,
+            **kernel_kwargs,
+        )
+        return q_norm, (q_int8, q_scales)
+
     def _compute_q_b(
         self,
         q: torch.Tensor,
         positions: torch.Tensor,
         q_out: Optional[torch.Tensor] = None,
+        *,
+        prequantized_int8: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        q, _ = self.wq_b(q)
+        if prequantized_int8 is None:
+            q, _ = self.wq_b(q)
+        else:
+            q, _ = self.wq_b(q, prequantized_int8=prequantized_int8)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if q_out is None:
             q_out = torch.empty_like(q)
@@ -1470,8 +1632,15 @@ class MQALayer(MqaAttentionBase):
             if q_out is not None:
                 q_out.copy_(q)
         else:
-            q_lora = self.q_norm(q_lora)
-            q = self._compute_q_b(q_lora, positions, q_out)
+            fused_q = self._try_hcu_q_rms_int8_quant(q_lora, forward_batch)
+            if fused_q is None:
+                q_lora = self.q_norm(q_lora)
+                q = self._compute_q_b(q_lora, positions, q_out)
+            else:
+                q_lora, prequantized_int8 = fused_q
+                q = self._compute_q_b(
+                    q_lora, positions, q_out, prequantized_int8=prequantized_int8
+                )
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).

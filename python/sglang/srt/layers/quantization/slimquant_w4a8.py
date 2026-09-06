@@ -391,6 +391,53 @@ class SlimQuantW4A8Int8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
+    def apply_prequantized(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        prequantized_int8: tuple[torch.Tensor, torch.Tensor],
+        bias: Optional[torch.Tensor] = None,
+    ):
+        """Use explicit per-token INT8 input only with the vetted strategy 3.
+
+        ``x`` is the retained activation-dtype output (also used by the DSV4
+        indexer). It supplies the output dtype/shape contract, not GEMM data.
+        This calls the same GEMM API as ordinary strategy 3; no large operator
+        is fused. The original apply/legacy environment gates remain untouched.
+        """
+        if self.w8a8_strategy != 3:
+            raise NotImplementedError("Prequantized INT8 input only supports strategy 3")
+        if not isinstance(prequantized_int8, tuple) or len(prequantized_int8) != 2:
+            raise ValueError("prequantized_int8 must be an (INT8, FP32 scale) tuple")
+        x_q, x_scale = prequantized_int8
+        if not all(isinstance(t, torch.Tensor) for t in (x, x_q, x_scale)):
+            raise TypeError("prequantized INT8 input and scales must be tensors")
+        if (
+            x.dim() != 2
+            or x.shape[0] == 0
+            or x.shape[1] != layer.input_size
+            or x.dtype not in (torch.bfloat16, torch.float16)
+            or not x.is_cuda
+            or x_q.shape != x.shape
+            or x_q.dtype != torch.int8
+            or x_q.device != x.device
+            or not x_q.is_contiguous()
+            or x_scale.shape != (x.shape[0], 1)
+            or x_scale.dtype != torch.float32
+            or x_scale.device != x.device
+            or not x_scale.is_contiguous()
+        ):
+            raise ValueError("Invalid per-token INT8 activation/FP32 [M, 1] scale metadata")
+        # Preserve the exact original strategy-3 call, including bias=None.
+        return quant_ops.blaslt_scaled_mm(
+            x_q,
+            layer.weight,
+            scale_a=x_scale,
+            scale_b=layer.weight_scale,
+            out_dtype=x.dtype,
+            bias=None,
+        )
+
 
 class SlimQuantW4A8Int8MoEMethod:
     """MoE method for W4A8INT8.
