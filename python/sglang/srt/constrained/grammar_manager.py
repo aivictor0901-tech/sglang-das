@@ -45,6 +45,12 @@ class GrammarManager:
             else False
         )
 
+        # Grammar admission must agree across both attention TP and CP ranks.
+        # With DP attention, dp_tp_group excludes CP; using it alone lets an
+        # asynchronously compiled grammar enter the bootstrap queue on only
+        # some CP ranks, mismatching the next bootstrap/request collectives.
+        self.grammar_cp_sync_group = scheduler.attn_cp_cpu_group
+        self.grammar_cp_sync_size = scheduler.attn_cp_group.world_size
         self.grammar_sync_group = scheduler.dp_tp_cpu_group
         self.grammar_sync_size = scheduler.dp_tp_group.world_size
         self.grammar_sync_entry = scheduler.dp_tp_group.first_rank
@@ -253,6 +259,23 @@ class GrammarManager:
                     *[x[0] for x in all_gather_output]
                 )
                 synced_failed_req_idxs = set.union(*[x[1] for x in all_gather_output])
+
+            # TP and CP form orthogonal groups within one attention DP shard.
+            # Intersect readiness and union failures along both dimensions so
+            # every participant advances the same ordered grammar queue.
+            if self.grammar_cp_sync_size > 1:
+                cp_gather_output = [None] * self.grammar_cp_sync_size
+                torch.distributed.all_gather_object(
+                    cp_gather_output,
+                    (synced_ready_req_idxs, synced_failed_req_idxs),
+                    group=self.grammar_cp_sync_group,
+                )
+                synced_ready_req_idxs = set.intersection(
+                    *[x[0] for x in cp_gather_output]
+                )
+                synced_failed_req_idxs = set.union(
+                    *[x[1] for x in cp_gather_output]
+                )
         else:
             synced_ready_req_idxs = ready_req_idxs
             synced_failed_req_idxs = failed_req_idxs
