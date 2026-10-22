@@ -51,6 +51,7 @@ from openai.types.responses.response_format_text_json_schema_config import (
 from openai.types.shared.response_format_json_object import ResponseFormatJSONObject
 from pydantic import (
     AfterValidator,
+    AliasChoices,
     BaseModel,
     ConfigDict,
     Field,
@@ -693,7 +694,10 @@ class ChatCompletionMessageGenericParam(BaseModel):
     )
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
-    reasoning_content: Optional[str] = None
+    reasoning_content: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_content", "reasoning"),
+    )
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
 
