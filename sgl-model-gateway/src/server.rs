@@ -21,6 +21,7 @@ use smg_mesh::{
 };
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
+use validator::Validate;
 use wfaas::LoggingSubscriber;
 
 use crate::{
@@ -49,7 +50,7 @@ use crate::{
         rerank::V1RerankReqInput,
         responses::{ResponsesGetParams, ResponsesRequest},
         tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
-        validated::ValidatedJson,
+        validated::{Normalizable, ValidatedJson},
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
@@ -181,10 +182,53 @@ async fn generate(
         .await
 }
 
+/// Preserve historical reasoning before the protocol crate drops unknown fields.
+#[derive(Deserialize)]
+#[serde(try_from = "Value")]
+struct ReasoningAliasChatCompletionRequest(ChatCompletionRequest);
+
+impl TryFrom<Value> for ReasoningAliasChatCompletionRequest {
+    type Error = serde_json::Error;
+
+    fn try_from(mut value: Value) -> Result<Self, Self::Error> {
+        if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
+            for message in messages {
+                let Some(message) = message.as_object_mut() else {
+                    continue;
+                };
+                if message.get("role").and_then(Value::as_str) != Some("assistant") {
+                    continue;
+                }
+                // An explicit canonical value wins, including null and empty text.
+                if let Some(reasoning) = message.remove("reasoning") {
+                    message
+                        .entry("reasoning_content".to_string())
+                        .or_insert(reasoning);
+                }
+            }
+        }
+        serde_json::from_value(value).map(Self)
+    }
+}
+
+impl Normalizable for ReasoningAliasChatCompletionRequest {
+    fn normalize(&mut self) {
+        self.0.normalize();
+    }
+}
+
+impl Validate for ReasoningAliasChatCompletionRequest {
+    fn validate(&self) -> Result<(), validator::ValidationErrors> {
+        self.0.validate()
+    }
+}
+
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    ValidatedJson(ReasoningAliasChatCompletionRequest(body)): ValidatedJson<
+        ReasoningAliasChatCompletionRequest,
+    >,
 ) -> Response {
     state
         .router
