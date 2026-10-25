@@ -1054,6 +1054,30 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             self.lm_head = lm_head
         self.markov_head.configure_tp_shard(lm_head=self.lm_head)
 
+    def enable_draft_lm_head_vp(
+        self, *, vp_size: int, max_rows_per_rank: int, local_world_size: int
+    ) -> None:
+        from sglang.srt.speculative.dspark_lm_head_vp import DSparkLMHeadVocabParallel
+
+        if self._use_fp32_lm_head:
+            raise ValueError(
+                "DSPARK draft LM-head VP cannot be combined with "
+                "SGLANG_DSPARK_FP32_LM_HEAD."
+            )
+        if self.lm_head is None or int(self.lm_head.tp_size) != 1:
+            raise ValueError("DSPARK draft VP requires a replicated DP LM-head.")
+        from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+
+        if should_apply_lm_head_quant_method(self.lm_head, self.lm_head.quant_method):
+            raise ValueError("DSPARK draft VP does not support a quantized LM-head.")
+        self.draft_lm_head_vp = DSparkLMHeadVocabParallel(
+            full_weight=self.lm_head.weight,
+            vocab_size=int(self.lm_head.org_vocab_size),
+            vp_size=vp_size,
+            max_rows_per_rank=max_rows_per_rank,
+            local_world_size=local_world_size,
+        )
+
     def prune_to_ctx_projection(self) -> None:
         if vars(self).get("is_lifecycle_only", False):
             return
@@ -1266,11 +1290,17 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             hc_eps=self.hc_eps,
         )
 
-    def compute_base_logits(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def compute_base_logits(
+        self, x: torch.Tensor, *, vp_padded_rows: Optional[int] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         x_post_hc = self.collapse_hc_head(x)
-        return self._logits_from_x_post_hc(x_post_hc), x_post_hc
+        return self._logits_from_x_post_hc(
+            x_post_hc, vp_padded_rows=vp_padded_rows
+        ), x_post_hc
 
-    def _logits_from_x_post_hc(self, x_post_hc: torch.Tensor) -> torch.Tensor:
+    def _logits_from_x_post_hc(
+        self, x_post_hc: torch.Tensor, *, vp_padded_rows: Optional[int] = None
+    ) -> torch.Tensor:
         if self.lm_head is None:
             raise ValueError(
                 "DeepseekV4ForCausalLMDSpark requires the target lm_head "
@@ -1279,6 +1309,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         last = self.stages[-1]
         x = last.norm(x_post_hc)
         weight = self.lm_head.weight
+        draft_vp = getattr(self, "draft_lm_head_vp", None)
+        if draft_vp is not None:
+            return draft_vp.project_logits(x, padded_rows=vp_padded_rows)
         if self._use_fp32_lm_head and weight.is_floating_point():
             local_logits = F.linear(x.float(), weight.float())
         else:
@@ -1324,8 +1357,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self._dspark_scale_suffix = (
             "weight_scale"
             if any(
-                key.endswith((".weight_scale", "_weight_scale"))
-                for key in params_dict
+                key.endswith((".weight_scale", "_weight_scale")) for key in params_dict
             )
             else "weight_scale_inv"
         )
@@ -1457,18 +1489,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if mapped_rest.endswith(".gate.bias_vl"):
             return None
         mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
-        scale_suffix = getattr(
-            self, "_dspark_scale_suffix", "weight_scale_inv"
-        )
+        scale_suffix = getattr(self, "_dspark_scale_suffix", "weight_scale_inv")
         # Some loaders normalize checkpoint scale names to weight_scale_inv
         # before the model remapper runs. Per-channel FP8 parameters expose
         # weight_scale, so normalize either input form to
         # the suffix selected from the instantiated draft parameters.
         if mapped_rest.endswith(".weight_scale_inv"):
             mapped_rest = (
-                mapped_rest.removesuffix(".weight_scale_inv")
-                + "."
-                + scale_suffix
+                mapped_rest.removesuffix(".weight_scale_inv") + "." + scale_suffix
             )
         else:
             mapped_rest = mapped_rest.replace(".scale", "." + scale_suffix)
