@@ -318,16 +318,33 @@ def cp_all_gather_rerange_launch(input_tensor, cp_size, comm_stream, event_key):
     return (output_tensor, input_tensor, event, cp_size)
 
 
-def cp_all_gather_rerange_finish(handle):
-    """Wait for a launched gather on the current stream, then rerange."""
-    output_tensor, _keepalive, event, cp_size = handle
-    torch.cuda.current_stream().wait_event(event)
+def _interleave_cp_output(output_tensor, cp_size):
+    """Reorder an exclusively owned, completed gather without a second buffer.
+
+    The optional LightOp kernel rotates disjoint row cycles in place. The
+    communication must finish before mutation; no consumer may retain the
+    original rank-major layout. Only the ordinary equal-share interleave path
+    uses this helper. Bounded-replay gather_index retains its compact selection.
+    """
+    import os
+
+    if os.environ.get("SGLANG_DSV4_CP_OUTPUT_INPLACE", "0") == "1":
+        from lightop.attention.cp_output import interleave_cp_output_
+
+        return interleave_cp_output_(output_tensor, cp_size)
     out_shape = output_tensor.shape
     return (
         output_tensor.view(cp_size, -1, *out_shape[1:])
         .transpose(0, 1)
         .reshape(out_shape)
     )
+
+
+def cp_all_gather_rerange_finish(handle):
+    """Wait for a launched gather on the current stream, then rerange."""
+    output_tensor, _keepalive, event, cp_size = handle
+    torch.cuda.current_stream().wait_event(event)
+    return _interleave_cp_output(output_tensor, cp_size)
 
 
 def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
@@ -377,13 +394,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
             # Decoder SWA bounded replay tail (interleave layout): ranks hold uneven,
             # padded shares, so map the rank-major rows straight to global tail order.
             return output_tensor[gather_index]
-        out_shape = output_tensor.shape
-        output_tensor = (
-            output_tensor.view(cp_size, -1, *out_shape[1:])
-            .transpose(0, 1)
-            .reshape(out_shape)
-        )
-        return output_tensor
+        return _interleave_cp_output(output_tensor, cp_size)
 
     # TODO: Do we need to remove the padding here?
     bs_seq_len, hidden_size = input_tensor.shape
