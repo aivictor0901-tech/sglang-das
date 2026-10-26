@@ -102,7 +102,9 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     token_req_indices,
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
-    C4IndexerBackendMixin, deep_gemm_fp4_paged_mqa_logits, topk_transform_paged_from_metadata,
+    C4IndexerBackendMixin,
+    deep_gemm_fp4_paged_mqa_logits,
+    topk_transform_paged_from_metadata,
 )
 from sglang.kernels.ops.attention.dsv4.topk import topk_transform_ragged_v2
 from sglang.srt.layers.attention.dsv4.metadata import (
@@ -260,7 +262,29 @@ def _get_target_verify_bs(forward_batch: ForwardBatch) -> int:
 T = TypeVar("T", bound=Optional[torch.Tensor])
 
 
-def _should_use_sparse_prefill(q: torch.Tensor, forward_batch: ForwardBatch, *, allow_cp: bool = False) -> bool:
+def _use_dsv41_compact_sparse_prefill_workspace(forward_batch: ForwardBatch) -> bool:
+    """Only HCU eager P-worker C1/C2; keep Decode, Graph and TBO unchanged."""
+    if not _is_hcu or forward_batch.forward_mode != ForwardMode.EXTEND:
+        return False
+    from sglang.srt.layers.attention.dsa.forward_batch_utils import (
+        effective_forward_mode,
+    )
+    from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+    from sglang.srt.runtime_context import get_disagg
+
+    return (
+        effective_forward_mode(forward_batch) == ForwardMode.EXTEND
+        and get_disagg().disaggregation_mode != "decode"
+        and not get_is_capture_mode()
+        and not torch.cuda.is_current_stream_capturing()
+        and getattr(forward_batch, "tbo_parent_token_range", None) is None
+        and not getattr(forward_batch, "tbo_children", None)
+    )
+
+
+def _should_use_sparse_prefill(
+    q: torch.Tensor, forward_batch: ForwardBatch, *, allow_cp: bool = False
+) -> bool:
     sparse_prefill_enabled = envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
     explicit_cp_override = (
         envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.is_set() and sparse_prefill_enabled
@@ -377,9 +401,8 @@ def _has_dense_fp4_indexer() -> bool:
             from lightop.attention import fp8_fp4_mqa_logits
         except (ImportError, AttributeError):
             return False
-        return (
-            callable(fp8_fp4_mqa_logits)
-            and hasattr(lightop_op, "fp8_fp4_mqa_logits")
+        return callable(fp8_fp4_mqa_logits) and hasattr(
+            lightop_op, "fp8_fp4_mqa_logits"
         )
     if torch.version.cuda is None:
         return False
@@ -421,7 +444,13 @@ def _hcu_dense_fp4_mqa_logits(
     if candidate_blocks is not None:
         _log_lightop_candidate_fp4_indexer_once()
         return fn(
-            q, kv_fp4, weights, ks, ke, False, max_seqlen_k,
+            q,
+            kv_fp4,
+            weights,
+            ks,
+            ke,
+            False,
+            max_seqlen_k,
             candidate_blocks=candidate_blocks,
             candidate_query_lens=candidate_query_lens,
         )
@@ -770,9 +799,11 @@ class DSV4AttnMetadata:
             )
         self.trtllm_swa_lens = _tile_padded(
             SWA_WINDOW,
-            self.swa_topk_lengths.clamp_min(SWA_WINDOW)
-            if swa_width > SWA_WINDOW
-            else None,
+            (
+                self.swa_topk_lengths.clamp_min(SWA_WINDOW)
+                if swa_width > SWA_WINDOW
+                else None
+            ),
         )
         for ratio in self.low_ratios:
             lengths = self.sparse_topk_lengths(ratio)
@@ -940,9 +971,9 @@ class DSV4AttnMetadata:
         # logical token; num_tokens is that unpadded length.
         if num_tokens is None:
             num_tokens = self.seq_lens_casual.shape[0]
-        assert self.raw_out_loc.shape[0] == num_tokens, (
-            f"{self.raw_out_loc.shape=}, {num_tokens=}"
-        )
+        assert (
+            self.raw_out_loc.shape[0] == num_tokens
+        ), f"{self.raw_out_loc.shape=}, {num_tokens=}"
 
         if self.has_c4 or self.has_c128:
             # One kernel produces both ratios; compute_page_indices=False only
@@ -1043,13 +1074,13 @@ class DSV4AttnMetadata:
         for field_name in self._CP_REINDEX_FIELDS + self._CP_REINDEX_OPTIONAL_FIELDS:
             val = getattr(self, field_name, None)
             if val is None:
-                assert field_name in self._CP_REINDEX_OPTIONAL_FIELDS, (
-                    f"CP reindex: {field_name} is None"
-                )
+                assert (
+                    field_name in self._CP_REINDEX_OPTIONAL_FIELDS
+                ), f"CP reindex: {field_name} is None"
                 continue
-            assert isinstance(val, torch.Tensor), (
-                f"CP reindex: {field_name} is {type(val)}, expected Tensor"
-            )
+            assert isinstance(
+                val, torch.Tensor
+            ), f"CP reindex: {field_name} is {type(val)}, expected Tensor"
             val = val[idx].contiguous()
             setattr(self, field_name, val)
             assert val.shape[0] == expected_local_len, (
@@ -1375,9 +1406,9 @@ class DeepseekV4AttnBackend(
         self.device = torch.device(model_runner.device)
         self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
-        assert head_dim == 512, (
-            "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
-        )
+        assert (
+            head_dim == 512
+        ), "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
@@ -2877,7 +2908,9 @@ class DeepseekV4AttnBackend(
         # request's C4/C128 workspace. Keep the device-side metadata path HCU-only.
         query_pos = core_attn_metadata.seq_lens_casual[:num_qo_tokens] - 1
         cp_active = (
-            dsa_use_prefill_cp(forward_batch) if _is_hcu else is_cp_active(forward_batch)
+            dsa_use_prefill_cp(forward_batch)
+            if _is_hcu
+            else is_cp_active(forward_batch)
         )
         if request_layout is not None:
             assert not cp_active
@@ -2922,6 +2955,13 @@ class DeepseekV4AttnBackend(
             max_seq_len=max(seq_lens_cpu_list),
             total_swa=total_swa,
             request_window_layout=request_layout,
+            compact_seq_lens_cpu=(
+                tuple(seq_lens_cpu_list)
+                if self.is_dsv41
+                and request_layout is None
+                and _use_dsv41_compact_sparse_prefill_workspace(forward_batch)
+                else None
+            ),
         )
 
     def _build_forward_metadata(
@@ -3305,15 +3345,17 @@ class DeepseekV4AttnBackend(
                 x_global,
                 req_global,
                 pos_global,
-                fuse_index_store=(
-                    x_global.is_cuda and _supports_index_k_rope_pack()
-                ),
+                fuse_index_store=(x_global.is_cuda and _supports_index_k_rope_pack()),
             )
         if run_indexer and layer.indexer is not None:
             if not _is_hcu:
                 self._low_ratio_index_topk(
-                    layer, x[:num_local], q_lora[:num_local], None,
-                    positions[:num_local].to(torch.int64), forward_batch,
+                    layer,
+                    x[:num_local],
+                    q_lora[:num_local],
+                    None,
+                    positions[:num_local].to(torch.int64),
+                    forward_batch,
                     rows_per_request=q_lens_cpu,
                 )
                 return
@@ -3373,9 +3415,10 @@ class DeepseekV4AttnBackend(
             from sglang.srt.layers.utils.hcu_cp_utils import ContextParallelMetadata
 
             # Legacy HCU CP uses the same original-row round-robin ownership.
-            if not isinstance(
-                cp_metadata, ContextParallelMetadata
-            ) or not is_dsa_prefill_cp_round_robin_split():
+            if (
+                not isinstance(cp_metadata, ContextParallelMetadata)
+                or not is_dsa_prefill_cp_round_robin_split()
+            ):
                 return None
         from sglang.srt.model_executor.runner_utils.capture_mode import (
             is_in_breakable_cuda_graph,
@@ -3529,10 +3572,7 @@ class DeepseekV4AttnBackend(
                 kv,
                 slots,
                 pos,
-                fuse_index_store=(
-                    x.is_cuda
-                    and _supports_index_k_rope_pack()
-                ),
+                fuse_index_store=(x.is_cuda and _supports_index_k_rope_pack()),
             )
             return
         if not x.is_cuda:
@@ -3574,12 +3614,14 @@ class DeepseekV4AttnBackend(
             c2_decode_norm_rope_store,
             c2_prefill_norm_rope_store,
         )
+
         # The JIT writer has a portable HIP FP4 encoder as well as the CUDA
         # intrinsic path. Keep norm, RoPE, both quantization stages and the
         # paged cache store in one launch on both backends.
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
             index_k_norm_rope_pack_store,
         )
+
         pool = self.token_to_kv_pool
         core = self.forward_metadata.core_metadata
         compressor = layer.compressor
@@ -3811,7 +3853,9 @@ class DeepseekV4AttnBackend(
         rows_per_request=None,  # NOTE: only used in CP
     ) -> None:
         if _is_hcu:
-            return self._hcu_low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
+            return self._hcu_low_ratio_index_topk(
+                layer, x, q_lora, req, pos, forward_batch
+            )
         is_source = layer.indexer.is_candidate_source
         is_consumer = layer.indexer.uses_candidates
         ratio = layer.compress_ratio
@@ -3852,7 +3896,9 @@ class DeepseekV4AttnBackend(
 
     def _low_ratio_index_topk_captured(self, layer, projected_q, projected_w) -> None:
         if _is_hcu:
-            return self._low_ratio_index_topk_prefill_graph(layer, None, projected_q, projected_w)
+            return self._low_ratio_index_topk_prefill_graph(
+                layer, None, projected_q, projected_w
+            )
         ratio = layer.compress_ratio
         indexer = layer.indexer
         core = self.forward_metadata.core_metadata
@@ -3976,7 +4022,9 @@ class DeepseekV4AttnBackend(
 
     # HCU preserves the validated LightOp dense/paged indexer and graph ABI.
     # Non-HCU dispatch above uses main's v41_indexer protocols.
-    def _hcu_low_ratio_index_topk(self, layer, x, q_lora, req, pos, forward_batch) -> None:
+    def _hcu_low_ratio_index_topk(
+        self, layer, x, q_lora, req, pos, forward_batch
+    ) -> None:
         is_decode_or_verify = (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
@@ -3988,9 +4036,8 @@ class DeepseekV4AttnBackend(
                 self._low_ratio_index_topk_decode(layer, x, q_lora, pos, req_ids)
             else:
                 self._low_ratio_index_topk_sm90_decode(layer, x, q_lora, req, pos)
-        elif (
-            self._use_dense_fp4_prefill_indexer(forward_batch)
-            and (_is_hcu or _is_sm100_or_newer())
+        elif self._use_dense_fp4_prefill_indexer(forward_batch) and (
+            _is_hcu or _is_sm100_or_newer()
         ):
             self._low_ratio_index_topk_extend(layer, x, q_lora, pos, forward_batch)
         else:
@@ -4338,9 +4385,9 @@ class DeepseekV4AttnBackend(
                         ke[rows].contiguous(),
                         width,
                         candidate_blocks=blocks,
-                        candidate_query_lens=[end - start]
-                        if blocks is not None
-                        else None,
+                        candidate_query_lens=(
+                            [end - start] if blocks is not None else None
+                        ),
                     )
                     if publish is not None:
                         scores = logits[:, :lc]
@@ -4455,7 +4502,9 @@ class DeepseekV4AttnBackend(
                     publish.append(empty_mask)
                     if publish_blocks is not None:
                         publish_blocks.append(
-                            torch.empty((t_len, 0), dtype=torch.int32, device=logits.device)
+                            torch.empty(
+                                (t_len, 0), dtype=torch.int32, device=logits.device
+                            )
                         )
                 continue
             scores = logits[rows, :lc]
@@ -4486,7 +4535,9 @@ class DeepseekV4AttnBackend(
             publish.append(masks[0] if len(masks) == 1 else torch.cat(masks))
             if publish_blocks is not None:
                 blocks = [item[1] for item in selections]
-                publish_blocks.append(blocks[0] if len(blocks) == 1 else torch.cat(blocks))
+                publish_blocks.append(
+                    blocks[0] if len(blocks) == 1 else torch.cat(blocks)
+                )
         if publish is not None:
             self.forward_metadata.candidate_metadata = CandidateMasks(
                 request_masks=publish, request_block_ids=publish_blocks
@@ -4678,9 +4729,9 @@ class DeepseekV4AttnBackend(
         if raw_indices is not None:
             raw_indices.fill_(-1)
         bs = req.shape[0]
-        assert pos.shape[0] == bs, (
-            f"decode expects one token per request, {pos.shape=} {bs=}"
-        )
+        assert (
+            pos.shape[0] == bs
+        ), f"decode expects one token per request, {pos.shape=} {bs=}"
         if bs == 0:
             return
         lens = (pos + 1) // ratio
@@ -4719,15 +4770,18 @@ class DeepseekV4AttnBackend(
         elif indexer.uses_candidates:
             # Published this step by the candidate-source layer's decode pass above.
             consume = published_masks(self.forward_metadata.candidate_metadata).mask
-            assert torch.is_tensor(consume) and consume.shape[0] == bs, (
-                "candidate mask missing for decode"
-            )
+            assert (
+                torch.is_tensor(consume) and consume.shape[0] == bs
+            ), "candidate mask missing for decode"
             # Pass the candidate mask to the fused kernel: it suppresses non-candidate
             # positions to -inf before running the radix top-k, so the output is
             # equivalent to the old masked_fill + torch.topk + sort + gather sequence
             # but in a single kernel launch.
             topk_transform_paged_from_metadata(
-                s, metadata, page_indices, raw_indices,
+                s,
+                metadata,
+                page_indices,
+                raw_indices,
                 candidate_mask=consume[:, :lmax],
             )
             return
@@ -5416,13 +5470,13 @@ class DeepseekV4AttnBackend(
 
             flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
 
-            assert swa_page_indices.shape[-1] % 64 == 0, (
-                f"{swa_page_indices.shape=}'s last dimension is not aligned to 64"
-            )
+            assert (
+                swa_page_indices.shape[-1] % 64 == 0
+            ), f"{swa_page_indices.shape=}'s last dimension is not aligned to 64"
             if extra_indices is not None:
-                assert extra_indices.shape[-1] % 64 == 0, (
-                    f"{extra_indices.shape=}'s last dimension is not aligned to 64"
-                )
+                assert (
+                    extra_indices.shape[-1] % 64 == 0
+                ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
             if not _is_hcu:
                 # RequestWindow sparse gathering does not support CP yet.
@@ -5655,7 +5709,17 @@ class DeepseekV4AttnBackend(
         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
 
+        compact_workspace = (
+            self.is_dsv41
+            and core_attn_metadata.request_window_layout is None
+            and _use_dsv41_compact_sparse_prefill_workspace(forward_batch)
+        )
         cache = self.forward_metadata.sparse_prefill_cache
+        if cache is not None and (
+            (getattr(cache, "compact_seq_lens_cpu", None) is not None)
+            != compact_workspace
+        ):
+            cache = None
         if cache is None:
             cache = self._build_sparse_prefill_chunk_cache(
                 forward_batch, core_attn_metadata, num_qo_tokens=q_flat.shape[0]
@@ -5669,8 +5733,11 @@ class DeepseekV4AttnBackend(
         extra_k_layout = None
         extra_page_size = None
         flat_token_ids = None
+        compressed_valid_count = None
         if compress_ratio == 0:
-            workspace = self.sparse_prefill_workspace.get(cache.swa_token_ids.shape[0])
+            workspace = self.sparse_prefill_workspace.get(
+                cache.swa_token_ids.shape[0], release_before_grow=compact_workspace
+            )
             combined_indices = cache.c0_combined_indices
             combined_lens = cache.c0_combined_lens
             swa_slice = workspace
@@ -5681,9 +5748,26 @@ class DeepseekV4AttnBackend(
             flat_token_ids, combined_indices, combined_lens = cache.layer_inputs(
                 compress_ratio, core_attn_metadata, extra_page_size
             )
+            if (
+                compact_workspace
+                and compress_ratio in (1, 2)
+                and q_flat.shape[0] > 0
+                and envs.SGLANG_DSV41_PREFILL_TOPK_KV_WORKSPACE.get()
+            ):
+                flat_token_ids, combined_indices, compressed_valid_count = (
+                    cache.pack_compressed_topk(
+                        flat_token_ids,
+                        combined_indices,
+                        combined_lens,
+                        topk=core_attn_metadata.sparse_raw_indices(
+                            compress_ratio
+                        ).shape[-1],
+                    )
+                )
             n_compressed = flat_token_ids.shape[0]
             workspace = self.sparse_prefill_workspace.get(
-                n_compressed + cache.swa_token_ids.shape[0]
+                n_compressed + cache.swa_token_ids.shape[0],
+                release_before_grow=compact_workspace,
             )
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
@@ -5706,6 +5790,7 @@ class DeepseekV4AttnBackend(
             and envs.SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED.get()
             and (compressed_slice is None or extra_k_layout is KVLayout.V4)
             and swa_k_layout is KVLayout.V4
+            and compressed_valid_count is None
         ):
             from lightop.kvcache import dsv4_dequantize_k_cache_paged_out
 
@@ -5731,6 +5816,7 @@ class DeepseekV4AttnBackend(
                     page_size=extra_page_size,
                     out=compressed_slice,
                     layout=extra_k_layout,
+                    valid_count=compressed_valid_count,
                 )
             dequantize_k_cache_paged(
                 token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
@@ -6065,9 +6151,9 @@ class DeepseekV4AttnBackend(
                 f"and is only valid on the DSpark draft backend "
                 f"(is_dspark_draft={self.is_dspark_draft})."
             )
-            assert swa_replay_start is None, (
-                "swa_replay_start is not wired for the DSpark draft window"
-            )
+            assert (
+                swa_replay_start is None
+            ), "swa_replay_start is not wired for the DSpark draft window"
             if dspark_swa_buffers is None:
                 swa_page_indices, swa_topk_lengths = self.get_dspark_swa_page_indices(
                     seq_lens_casual=seq_lens_casual,
