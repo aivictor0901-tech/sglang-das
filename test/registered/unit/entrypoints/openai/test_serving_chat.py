@@ -3442,6 +3442,55 @@ class DSV4ChatRegressionTest(CustomTestCase):
                     repr(tokenized_prompt),
                 )
 
+    def test_reasoning_follows_encoder_default_and_request_override(self):
+        """A template's inferred default must not override the DSV4 encoder.
+
+        Otherwise a prefilled opening think tag is absent from generated text
+        and the response parser silently treats reasoning as answer content.
+        """
+        for default in (False, True):
+            self.template_manager.reasoning_config = ReasoningToggleConfig(
+                toggle_param="thinking", default_enabled=not default
+            )
+            for kwargs in (None, {}, {"thinking": True}, {"thinking": False}):
+                with self.subTest(default=default, kwargs=kwargs):
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Hi"}],
+                        chat_template_kwargs=kwargs,
+                    )
+                    with envs.SGLANG_DEFAULT_THINKING.override(default):
+                        self.assertEqual(
+                            self.chat._get_reasoning_from_request(request),
+                            (kwargs or {}).get("thinking", default),
+                        )
+
+        self.chat.reasoning_parser = None
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+            chat_template_kwargs={"thinking": True},
+        )
+        with envs.SGLANG_DEFAULT_THINKING.override(True):
+            self.assertFalse(self.chat._get_reasoning_from_request(request))
+
+    def test_default_thinking_response_separates_reasoning(self):
+        """Parse an output whose opening think tag was already in the prompt."""
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "1+1?"}],
+            separate_reasoning=True,
+        )
+        result = _spec_result(0)
+        result["text"] = "1 + 1 = 2.</think>2"
+
+        with envs.SGLANG_DEFAULT_THINKING.override(True):
+            response = self.chat._build_chat_response(request, [result], created=0)
+
+        message = response.choices[0].message
+        self.assertEqual(message.content, "2")
+        self.assertEqual(message.reasoning_content, "1 + 1 = 2.")
+
 
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
     """Test _process_tool_calls with tool_choice='required' uses model-specific parser."""

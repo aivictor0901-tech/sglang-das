@@ -2487,6 +2487,15 @@ class OpenAIServingChat(OpenAIServingBase):
         if not self.reasoning_parser:
             return False
 
+        if self.chat_encoding_spec == "dsv4":
+            # Match the encoder: its opening think tag is part of the prompt,
+            # so the response parser must start in the same reasoning mode.
+            return bool(
+                (request.chat_template_kwargs or {}).get(
+                    "thinking", envs.SGLANG_DEFAULT_THINKING.get()
+                )
+            )
+
         if self.reasoning_parser == "minimax-m3":
             # M3 template prefills <mm:think> for thinking_mode=enabled, so it never
             # appears in output and reasoning must be forced. Mirrors reasoning_parser.py.
