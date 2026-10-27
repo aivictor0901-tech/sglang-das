@@ -1353,6 +1353,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_effort=v4_reasoning_effort,
                     reasoning_effort_profile=reasoning_effort_profile,
                 )
+                # Separate the prefilled think end from the first answer token.
+                # Continuing an assistant message must preserve its exact prefix.
+                if (
+                    thinking_mode == ThinkingMode.CHAT
+                    and not assistant_prefix
+                    and real_input.endswith(encoding_dsv4.thinking_end_token)
+                ):
+                    real_input += "\n"
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
             else:
                 real_input = encoding_dsv32.encode_messages(
