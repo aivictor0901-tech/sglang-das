@@ -42,6 +42,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -3391,6 +3392,55 @@ class ServingChatTestCase(unittest.TestCase):
         r, t = self.chat._get_parsed_response_fields(reasoning, tool_calls)
         self.assertEqual(r, reasoning)
         self.assertEqual(t, tool_calls)
+
+
+class DSV4ChatRegressionTest(CustomTestCase):
+    def setUp(self):
+        self.tm = _MockTokenizerManager()
+        self.template_manager = _MockTemplateManager()
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="thinking", default_enabled=False
+        )
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.chat.chat_encoding_spec = "dsv4"
+        self.chat._dsv4_reasoning_effort_profile = "official"
+        self.chat.reasoning_parser = "deepseek-v4"
+        self.tm.tokenizer.encode.side_effect = lambda text: list(map(ord, text))
+
+    def test_non_thinking_chat_boundary_before_tokenization(self):
+        """Short-answer CHAT prompts need a newline after the prefilled think end.
+
+        Thinking prompts, assistant continuations and DSV3.2 must keep their
+        original boundaries rather than inheriting this DSV4 compatibility fix.
+        """
+        cases = (
+            ("dsv4", False, None, "<｜Assistant｜></think>\n"),
+            ("dsv4", True, None, "<｜Assistant｜><think>"),
+            ("dsv4", False, "The answer is ", "<｜Assistant｜></think>The answer is "),
+            ("dsv32", False, None, "<｜Assistant｜></think>"),
+        )
+        for spec, thinking, prefix, expected_suffix in cases:
+            with self.subTest(spec=spec, thinking=thinking, prefix=prefix):
+                self.chat.chat_encoding_spec = spec
+                messages = [{"role": "user", "content": "1+1? Reply only a digit."}]
+                if prefix is not None:
+                    messages.append({"role": "assistant", "content": prefix})
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=messages,
+                    chat_template_kwargs={"thinking": thinking},
+                    continue_final_message=prefix is not None,
+                )
+
+                result = self.chat._process_messages(request, is_multimodal=False)
+
+                tokenized_prompt = "".join(map(chr, result.prompt_ids))
+                self.assertTrue(
+                    tokenized_prompt.endswith(expected_suffix),
+                    repr(tokenized_prompt),
+                )
 
 
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
