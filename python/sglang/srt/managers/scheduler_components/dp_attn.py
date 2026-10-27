@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
@@ -62,6 +63,42 @@ _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 # constants available while the new elastic-DP implementation owns the payload.
 DP_DECODE_STEP_PROTOCOL_VERSION = 2
 DP_DECODE_STEP_BUILD_ID = 2026071602
+
+
+_SCHEDULER_INFO_COPY_STATE = threading.local()
+
+
+def _use_async_scheduler_info(device):
+    return (
+        envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
+        and torch.device(device).type == "cuda"
+    )
+
+
+def _make_scheduler_info_tensor(values, device, dtype):
+    if _use_async_scheduler_info(device):
+        # Keep the small metadata upload asynchronous on the scheduler stream.
+        # PyTorch's pinned allocator tracks the copy before recycling storage.
+        host_info = torch.tensor(values, dtype=dtype, device="cpu", pin_memory=True)
+        return host_info.to(device=device, non_blocking=True)
+    return torch.tensor(values, device=device, dtype=dtype)
+
+
+def _copy_scheduler_info_to_cpu(info):
+    # Each result owns its storage: older MLPSyncBatchInfo views stay valid.
+    host_info = torch.empty_like(info, device="cpu", pin_memory=True)
+    events = getattr(_SCHEDULER_INFO_COPY_STATE, "events", None)
+    if events is None:
+        events = _SCHEDULER_INFO_COPY_STATE.events = {}
+    done = events.get(info.device)
+    if done is None:
+        done = events[info.device] = torch.cuda.Event()
+
+    host_info.copy_(info, non_blocking=True)
+    done.record(torch.cuda.current_stream(info.device))
+    # Replace the blocking D2H wait; CPU consumers below need complete values.
+    done.synchronize()
+    return host_info
 
 
 def _spec_input_cuda_graph_compatible(
@@ -153,7 +190,7 @@ class MLPSyncBatchInfo:
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
-        return torch.tensor(
+        return _make_scheduler_info_tensor(
             [
                 self.num_tokens,
                 self.num_tokens_for_logprob,
@@ -172,7 +209,7 @@ class MLPSyncBatchInfo:
         )
 
     def _get_fallback_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
-        return torch.tensor(
+        return _make_scheduler_info_tensor(
             [
                 0,  # num_tokens
                 0,  # num_tokens_for_logprob
@@ -209,6 +246,7 @@ class MLPSyncBatchInfo:
         use_all_reduce: bool = False,
     ):
         sync_start = time.perf_counter()
+        async_info = _use_async_scheduler_info(device)
         local_info_tensor = self._get_local_tensor(device=device)
         fallback_tensor = self._get_fallback_tensor(device=device)
         info_width = local_info_tensor.numel()
@@ -234,7 +272,12 @@ class MLPSyncBatchInfo:
                 group=group,
             )
             missing = flat_info.abs().sum(dim=1) == 0
-            flat_info[missing] = fallback_tensor
+            if async_info:
+                torch.where(
+                    missing[:, None], fallback_tensor, flat_info, out=flat_info
+                )
+            else:
+                flat_info[missing] = fallback_tensor
         else:
             all_gather_single(
                 global_info_tensor.flatten(),
@@ -256,13 +299,21 @@ class MLPSyncBatchInfo:
                 dtype=tp_active_ranks.dtype,
                 device=tp_active_ranks.device,
             )
-        tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = fallback_tensor
+        inactive = tp_active_ranks[:num_ranks_in_tp_info] == 0
+        if async_info:
+            # Boolean indexing calls nonzero(), which reads its size on CPU.
+            torch.where(inactive[:, None], fallback_tensor, tp_info, out=tp_info)
+        else:
+            tp_info[inactive] = fallback_tensor
 
         # One D2H for every field: each `.item()` / `.tolist()` on a device
         # tensor is its own stream sync. Copy the whole tensor, not the
         # `[:, 0, :]` slice -- that slice is non-contiguous once
         # attn_tp * attn_cp > 1, adding a gather kernel inside the wait.
-        tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
+        if async_info:
+            tp0_info_cpu = _copy_scheduler_info_to_cpu(global_info_tensor)[:, 0, :]
+        else:
+            tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
