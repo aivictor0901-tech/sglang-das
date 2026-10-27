@@ -16,6 +16,7 @@ from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import get_cp_strategy
 from sglang.srt.layers.dp_attention import dp_gather_width, world_dp_gather_enabled
+from sglang.srt.layers.dspark_dp import use_local_dspark_dp_batches
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
@@ -647,8 +648,8 @@ def prepare_mlp_sync_batch_raw(
         _update_gather_batch(
             batch_to_gather,
             mlp_sync_info,
-            require_mlp_tp_gather,
-            draft_require_mlp_tp_gather,
+            require_mlp_tp_gather and not use_local_dspark_dp_batches(),
+            False if use_local_dspark_dp_batches() else draft_require_mlp_tp_gather,
             skip_global_metadata=not metadata_ready,
         )
 

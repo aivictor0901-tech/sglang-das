@@ -551,6 +551,14 @@ class DraftBlockProposer:
         forward_batch.global_num_token_non_padded_cpu = num_tokens
         forward_batch.global_num_tokens_cpu = gnt
         forward_batch.global_num_tokens_for_logprob_cpu = gnt_logprob
+        if len(gnt) == 1 and envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get():
+            forward_batch.global_num_tokens_gpu = torch.full(
+                (1,), gnt[0], dtype=torch.int64, device=device
+            )
+            forward_batch.global_num_tokens_for_logprob_gpu = torch.full(
+                (1,), gnt_logprob[0], dtype=torch.int64, device=device
+            )
+            return
         pin_memory = is_pin_memory_available(device)
         forward_batch.global_num_tokens_gpu = torch.tensor(
             gnt, dtype=torch.int64, pin_memory=pin_memory

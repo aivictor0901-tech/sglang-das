@@ -932,6 +932,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self.original_global_num_tokens_cpu = global_num_tokens_source
         self.global_num_tokens_cpu = global_num_tokens
+        if (
+            len(global_num_tokens) == 1
+            and self.spec_algorithm.is_dspark()
+            and envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+        ):
+            # Local counts are launch constants. Fill on device instead of
+            # adding host-to-device metadata copies to the skipped-sync path.
+            self.global_num_tokens_gpu = torch.full(
+                (1,), global_num_tokens[0], dtype=torch.int64, device=device
+            )
+            self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
+            self.global_num_tokens_for_logprob_gpu = torch.full(
+                (1,), global_num_tokens_for_logprob[0], dtype=torch.int64, device=device
+            )
+            return
         pin_memory = is_pin_memory_available(device)
         self.global_num_tokens_gpu = torch.tensor(
             global_num_tokens, dtype=torch.int64, pin_memory=pin_memory
@@ -1923,12 +1938,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
         self.global_num_tokens_cpu = global_num_tokens
         self.use_pin_memory = not _is_cpu
-        global_num_tokens_pinned = torch.tensor(
-            global_num_tokens, pin_memory=self.use_pin_memory
-        )
-        self.global_num_tokens_gpu.copy_(
-            global_num_tokens_pinned, non_blocking=self.use_pin_memory
-        )
+        if (
+            len(global_num_tokens) == 1
+            and self.spec_algorithm.is_dspark()
+            and envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+        ):
+            self.global_num_tokens_gpu.fill_(global_num_tokens[0])
+        else:
+            global_num_tokens_pinned = torch.tensor(
+                global_num_tokens, pin_memory=self.use_pin_memory
+            )
+            self.global_num_tokens_gpu.copy_(
+                global_num_tokens_pinned, non_blocking=self.use_pin_memory
+            )
 
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker

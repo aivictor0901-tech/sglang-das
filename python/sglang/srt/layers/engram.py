@@ -48,10 +48,11 @@ from sglang.srt.layers.dp_attention import (
     is_dp_gatherv_active,
 )
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.dspark_dp import use_local_dspark_dp_batches
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_model, get_parallel, get_serving
+from sglang.srt.runtime_context import get_exec, get_model, get_parallel, get_serving, get_spec
 from sglang.srt.utils import (
     add_prefix,
     get_bool_env_var,
@@ -801,6 +802,7 @@ class EngramEmbedding(nn.Module):
         row_end = num_embeddings * (tp_rank + 1) // self.tp_size
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
+        self._local_dp_workspace = None
         if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
             self._init_host_table(num_embeddings, dim, layer_id)
         else:
@@ -918,18 +920,19 @@ class EngramEmbedding(nn.Module):
             *indices.shape, self.dim, dtype=torch.bfloat16, device=indices.device
         )
 
-    def _owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
+    def _owned_rows(self, indices: torch.Tensor, out=None) -> torch.Tensor:
         """Rows of `indices` this rank's shard holds, zero for the rest."""
         if self.rows == 0:
-            return self._empty(indices).zero_()
+            return (self._empty(indices) if out is None else out).zero_()
         if self.host_table is None and not _cuda_kernels(indices):
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
             local = local.masked_fill(~owned, 0)
             rows = self.weight[local].float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
             values = (rows * self.scale[local].float().unsqueeze(-1)).flatten(-2)
-            return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
-        out = self._empty(indices)
+            values = values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
+            return values if out is None else out.copy_(values)
+        out = self._empty(indices) if out is None else out
         engram_gather(
             *self._table_ptrs(),
             indices.reshape(-1),
@@ -946,6 +949,8 @@ class EngramEmbedding(nn.Module):
     ) -> torch.Tensor:
         """Gather DP ranks' indices before looking up TP-sharded rows."""
         assert forward_batch is not None, "the DP engram lookup needs the batch"
+        if use_local_dspark_dp_batches():
+            return self._local_dp_lookup(indices)
         rows = get_global_dp_buffer_len()
         ids_global = torch.empty(
             (rows, *indices.shape[1:]), dtype=indices.dtype, device=indices.device
@@ -976,6 +981,45 @@ class EngramEmbedding(nn.Module):
         else:
             dp_scatter(local, self._reduce_owned_rows(values), forward_batch)
         return local.view(*indices.shape, self.dim)
+
+    def _local_dp_lookup(self, indices: torch.Tensor) -> torch.Tensor:
+        """Keep only Engram's existing two collectives at a common capacity.
+
+        Attention/MoE use each rank's local graph bucket. The Engram tables are
+        TP-sharded, so their ID and value reductions still need equal sizes.
+        Their slots are allocated once; no request-count exchange, host scalar
+        extraction, or per-step host/device transfer is needed.
+        """
+        from sglang.kernels.ops.embeddings.engram_dp import pack_engram_ids
+
+        p = get_parallel()
+        capacity = max(get_exec().graph.cuda_graph_config.decode.bs) * int(
+            get_spec().speculative_num_draft_tokens
+        )
+        if indices.shape[0] > capacity:
+            raise ValueError("DSpark skip-all-gather Engram supports decode-sized batches only")
+        if self._local_dp_workspace is None:
+            ids = torch.empty(
+                (p.tp_size, capacity, *indices.shape[1:]),
+                dtype=indices.dtype, device=indices.device,
+            )
+            values = torch.empty(
+                (p.tp_size * capacity, *indices.shape[1:], self.dim),
+                dtype=torch.bfloat16, device=indices.device,
+            )
+            self._local_dp_workspace = ids, values
+        ids, values = self._local_dp_workspace
+        if ids.shape[2:] != indices.shape[1:] or ids.dtype != indices.dtype:
+            raise ValueError("Engram hash layout changed after decode workspace allocation")
+        pack_engram_ids(indices, ids, rank=p.tp_rank)
+        if _is_hip:
+            inplace_all_reduce(ids, group_name=p.tp_group.unique_name)
+        else:
+            ids.copy_(tensor_model_parallel_all_reduce(ids))
+        self._owned_rows(ids.flatten(0, 1), out=values)
+        values = self._reduce_owned_rows(values)
+        start = p.tp_rank * capacity
+        return values[start : start + indices.shape[0]].view(*indices.shape, self.dim)
 
 
 def engram_gate(

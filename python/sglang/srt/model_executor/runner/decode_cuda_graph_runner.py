@@ -58,6 +58,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.dspark_dp import use_local_dspark_dp_batches
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
@@ -251,13 +252,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # TP-sharded Engram also gathers across attention-DP ranks, even when
         # DeepEP keeps the MLP DP-local. Reuse the synchronized token buffers
         # and max-DP graph bucket for both capture and replay.
+        self.local_dspark_dp = use_local_dspark_dp_batches()
+        if self.local_dspark_dp:
+            logger.info("DSpark skip scheduler all-gather: rank-local decode graph buckets")
         self.require_mlp_tp_gather = (
             require_mlp_tp_gather()
             or (
                 model_runner.model_config.use_engram
                 and get_parallel().attn_dp_size > 1
             )
-        ) and not self._forward_is_dp_local(model_runner)
+        ) and not (self._forward_is_dp_local(model_runner) or self.local_dspark_dp)
         self.require_attn_tp_gather = require_attn_tp_gather()
         # Composite predicates derive from the instance values so the dp-local
         # draft exemption above stays consistent (require_gathered_buffer ==
@@ -619,6 +623,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.require_mlp_tp_gather:
             return [num_tokens] * self.num_dp_ranks
         if self.require_attn_tp_gather:
+            return [num_tokens]
+        if self.local_dspark_dp:
+            # One local entry, never a fabricated list of remote request counts.
             return [num_tokens]
         return None
 
