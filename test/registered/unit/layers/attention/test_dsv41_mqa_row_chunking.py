@@ -544,6 +544,9 @@ class TestDSV41MQARowChunking(CustomTestCase):
 
         ns.update(
             _lightop_functions=lambda: (None, None, None),
+            prefill_sparse_backend=lambda: "lightop",
+            _sparse_functions=lambda backend: (None, None, None),
+            _log_consumer=lambda *args, **kwargs: None,
             _lightop_fused_consumer=lambda x: native,
         )
         pages = torch.zeros(4, 513, dtype=torch.int32)

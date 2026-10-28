@@ -5,6 +5,7 @@ an existing candidate mask/table into sorted logical blocks, scores those blocks
 with FP32 head weights and logits, and restores the backend's sorted selections.
 """
 
+import logging
 from typing import Callable, Optional
 
 import torch
@@ -23,11 +24,39 @@ SPARSE_BLOCK_KV = 8
 INVALID_BLOCK = torch.iinfo(torch.int32).max
 # Same floor as torch_quant.fake_quant_fp4, before the divide by six.
 FP4_AMAX_FLOOR = 6 * 2.0**-126
+logger = logging.getLogger(__name__)
+_logged_consumers = set()
 
 
 def prefill_paged_sparse_enabled() -> bool:
     """Enable the HCU Prefill paged sparse consumer by default."""
     return envs.SGLANG_HCU_PREFILL_PAGED_SPARSE.get()
+
+
+def prefill_sparse_backend() -> str:
+    backend = envs.SGLANG_HCU_PREFILL_SPARSE_BACKEND.get()
+    if backend not in ("lightop", "deepgemm"):
+        raise ValueError(
+            "SGLANG_HCU_PREFILL_SPARSE_BACKEND must be lightop or deepgemm, "
+            f"got {backend!r}"
+        )
+    return backend
+
+
+def _unsupported_consumer(reason: str) -> bool:
+    if prefill_sparse_backend() == "deepgemm":
+        raise RuntimeError(f"DeepGemm Prefill sparse consumer unavailable: {reason}")
+    return False
+
+
+def _log_consumer(backend, layer_id, q, k_cache, preparation="triton"):
+    key = (backend, layer_id, preparation)
+    if key not in _logged_consumers:
+        _logged_consumers.add(key)
+        logger.info(
+            "DSV4.1 Prefill sparse consumer backend=%s layer=%s preparation=%s Q=%s KV=%s",
+            backend, layer_id, preparation, tuple(q.shape), tuple(k_cache.shape),
+        )
 
 
 if triton is not None:
@@ -281,6 +310,157 @@ def _lightop_functions():
     )
 
 
+def _sparse_functions(backend: str):
+    if backend == "lightop":
+        return _lightop_functions()
+    try:
+        import deepgemm
+        from lightop import topk_transform_ragged_v2
+
+        metadata_fn = deepgemm.get_paged_sparse_mqa_logits_metadata
+        scorer_fn = deepgemm.fp8_fp4_paged_sparse_mqa_logits
+    except (ImportError, OSError, AttributeError) as exc:
+        raise RuntimeError(
+            "DeepGemm Prefill sparse backend requires the native paged sparse "
+            "MQA APIs (a856d1f or compatible) and the FP32 ragged TopK operator"
+        ) from exc
+    if not all(callable(fn) for fn in (metadata_fn, scorer_fn, topk_transform_ragged_v2)):
+        raise RuntimeError("DeepGemm Prefill sparse backend has non-callable APIs")
+
+    def schedule(lengths, table, ids, page, blocks, dtype, block, *, num_sms=None):
+        # DeepGemm owns its schedule/metadata ABI and selects scheduling internally.
+        return metadata_fn(lengths, table, ids, page, blocks, dtype, block)
+
+    def score(q, kv, weights, metadata, capacity, block, *, num_sms=None, is_prefill=False):
+        # Keep the existing whole-block contract: FP32 ragged TopK below masks
+        # the causal tail before selection. No LightOp metadata or flags cross ABIs.
+        return scorer_fn(q, kv, weights, metadata, capacity, block, mask_tail=False)
+
+    return schedule, score, topk_transform_ragged_v2
+
+
+def _deepgemm_fused_consumer(x):
+    """Reuse native LightOp preparation/finalization around the DeepGemm scorer."""
+    if not envs.SGLANG_HCU_PREFILL_SPARSE_FUSION.get() or not x.is_cuda:
+        return None
+    try:
+        from lightop.attention.mqa import supports_prefill_sparse_fusion
+    except (ImportError, OSError):
+        return None
+    return _consume_deepgemm_prepared if supports_prefill_sparse_fusion(x) else None
+
+
+def _consume_deepgemm_prepared(
+    q, raw_weights, freqs_cis, positions, *, weight_scale, rope_dim, k_cache,
+    req_to_token, request_pool_indices, context_lens_per_request, rows_per_request,
+    request_block_ids, compress_ratio, page_size, num_max_sparse_blocks,
+    index_topk, out_page_indices, out_raw_indices=None, budget_bytes=1 << 30,
+):
+    from lightop.attention.mqa import (
+        _prepare_prefill_sparse_request,
+        finalize_prefill_sparse_indices,
+        prepare_prefill_sparse_candidates,
+        prepare_prefill_sparse_query,
+    )
+
+    schedule, score, topk = _sparse_functions("deepgemm")
+    rows, heads, _ = q.shape
+    width = num_max_sparse_blocks
+    if (
+        len(rows_per_request) != len(context_lens_per_request)
+        or len(request_block_ids) != len(rows_per_request)
+        or sum(rows_per_request) != rows
+    ):
+        raise ValueError("ragged requests do not match projected queries")
+    if budget_bytes <= 0 or compress_ratio <= 0:
+        raise ValueError("positive scratch budget and compression ratio required")
+    combined = heads == 32
+    if not combined:
+        query_data = prepare_prefill_sparse_query(
+            q, raw_weights, freqs_cis, positions, rope_dim, weight_scale,
+            compress_ratio, width,
+        )
+    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    offset = 0
+    for request, (count, length, source) in enumerate(
+        zip(rows_per_request, context_lens_per_request, request_block_ids)
+    ):
+        end = offset + count
+        if count == 0 or length == 0:
+            out_page_indices[offset:end, :index_topk].fill_(-1)
+            if out_raw_indices is not None:
+                out_raw_indices[offset:end, :index_topk].fill_(-1)
+            offset = end
+            continue
+        if source is None or source.ndim != 2 or source.shape[0] != count:
+            raise ValueError("published candidate rows must match requests")
+        request_id = request_pool_indices[request:request + 1]
+        row_flags = torch.empty((count,), device=q.device, dtype=torch.int32)
+        if combined:
+            payload, sf, weights, lengths, valid_lens, pairs, zeros, blocks, pages = (
+                _prepare_prefill_sparse_request(
+                    q[offset:end], raw_weights[offset:end], freqs_cis,
+                    positions[offset:end], rope_dim, weight_scale, compress_ratio,
+                    width, source, req_to_token, request_id, length, page_size,
+                    row_flags=row_flags,
+                )
+            )
+        else:
+            payload, sf, weights, lengths, valid_lens, _, zeros = [
+                tensor[offset:end] for tensor in query_data
+            ]
+            pairs = query_data[5]
+            blocks, pages = prepare_prefill_sparse_candidates(
+                source, width, req_to_token, request_id, length, compress_ratio,
+                page_size, row_flags=row_flags,
+            )
+        # Keep the existing conservative row budget; DeepGemm's own compact
+        # metadata and per-tile flags fit within the original planner allowance.
+        splits = (width + 79) // 80
+        row_bytes = (
+            width * (8 * 4 + 4) + pages.numel() * 4
+            + splits * (16 + 80 * 8 + 16)
+            + heads * (64 + 4 + 4) + index_topk * 16
+        )
+        step = max(1, budget_bytes // max(1, row_bytes))
+        for begin in range(0, count, step):
+            stop = min(begin + step, count)
+            block_chunk = blocks[begin:stop]
+            page_table = pages[None, :].expand(stop - begin, -1)
+            metadata = schedule(
+                lengths[begin:stop], page_table, pairs[:stop - begin],
+                page_size, block_chunk, payload.dtype, SPARSE_BLOCK_KV,
+                num_sms=num_sms,
+            )
+            logits = score(
+                (payload[begin:stop], sf[begin:stop]), k_cache,
+                weights[begin:stop], metadata, width, SPARSE_BLOCK_KV,
+                num_sms=num_sms, is_prefill=True,
+            )
+            if logits.dtype != torch.float32:
+                raise RuntimeError("paged sparse Prefill logits must be FP32")
+            compact = torch.empty(
+                (stop - begin, index_topk), device=q.device, dtype=torch.int32
+            )
+            topk(
+                logits, valid_lens[begin:stop], out_offsets=zeros[begin:stop],
+                out_indices=compact,
+            )
+            start, finish = offset + begin, offset + stop
+            finalize_prefill_sparse_indices(
+                compact, block_chunk, lengths[begin:stop], valid_lens[begin:stop],
+                out_logical=None if out_raw_indices is None
+                else out_raw_indices[start:finish, :index_topk],
+                req_to_token=req_to_token, request_id=request_id,
+                compress_ratio=compress_ratio,
+                out_page_indices=out_page_indices[start:finish, :index_topk],
+                candidate_flags=row_flags[begin:stop],
+            )
+            del logits, compact, metadata
+        offset = end
+
+
+
 def select_prefill_sparse_rows(
     *,
     q_fp4: torch.Tensor,
@@ -325,8 +505,9 @@ def select_prefill_sparse_rows(
     )
     if rows == 0:
         return selected
+    backend = prefill_sparse_backend()
     if schedule_fn is None or logits_fn is None or topk_fn is None:
-        functions = _lightop_functions()
+        functions = _sparse_functions(backend)
         if functions is None:
             raise RuntimeError(
                 "LightOp paged sparse Prefill and FP32 ragged TopK are required"
@@ -359,7 +540,7 @@ def select_prefill_sparse_rows(
         pair_ids = (
             torch.arange(end - begin, device=q_fp4.device, dtype=torch.int32) // 2
         )
-        cache_key = (begin, end, width, page_size, num_sms)
+        cache_key = (backend, begin, end, width, page_size, num_sms)
         metadata = None if schedule_cache is None else schedule_cache.get(cache_key)
         if metadata is None:
             metadata = schedule_fn(
@@ -439,19 +620,20 @@ def consume_prefill_candidate_sparse(
     """
     if not indexer.uses_candidates or indexer.is_candidate_source:
         return False
+    backend = prefill_sparse_backend()
     if indexer.candidate_block_size != 8 or indexer.index_head_dim != 128:
-        return False
+        return _unsupported_consumer("requires block=8 and head_dim=128")
     if not 0 < indexer.n_local_heads <= 32 or indexer.n_local_heads % 4:
-        return False
+        return _unsupported_consumer("requires 4..32 heads in multiples of four")
     width = indexer.candidate_topk_blocks
     if width <= 0 or width % 4 or width > 4096:
-        return False
+        return _unsupported_consumer("invalid candidate table width")
     masks = getattr(candidate_metadata, "request_masks", None)
     retained = getattr(candidate_metadata, "request_block_ids", None)
     candidates = retained if retained is not None else masks
     if candidates is None or len(candidates) != len(rows_per_request):
-        return False
-    functions = _lightop_functions()
+        return _unsupported_consumer("published candidates are missing")
+    functions = _sparse_functions(backend)
     if functions is None:
         return False
     if (
@@ -461,12 +643,15 @@ def consume_prefill_candidate_sparse(
         raise ValueError("ragged request rows do not match Prefill Q")
     page_size = pool.get_index_k_page_size(compress_ratio)
     if page_size <= 0 or page_size % 8:
-        return False
+        return _unsupported_consumer("page size must be a positive multiple of eight")
     k_cache = pool.get_index_k_with_scale_buffer(layer_id)
     if k_cache is None:
-        return False
+        return _unsupported_consumer("packed index-K cache is missing")
     k_cache = k_cache.view(k_cache.shape[0], page_size, 1, 68)
-    fused_consumer = _lightop_fused_consumer(x)
+    fused_consumer = (
+        _lightop_fused_consumer(x) if backend == "lightop"
+        else _deepgemm_fused_consumer(x)
+    )
     retained = getattr(candidate_metadata, "request_block_ids", None)
     if (
         fused_consumer is not None
@@ -505,6 +690,7 @@ def consume_prefill_candidate_sparse(
             out_raw_indices=raw_indices,
             budget_bytes=budget_bytes,
         )
+        _log_consumer(backend, layer_id, q, k_cache, preparation="lightop-native")
         return True
     # The original adapter needs -1 for skipped requests and output padding.
     page_indices.fill_(-1)
@@ -515,6 +701,7 @@ def consume_prefill_candidate_sparse(
         cache = {}
         candidate_metadata._lightop_prefill_sparse_cache = cache
     key = (
+        backend,
         width,
         tuple(lc_per_request),
         tuple(rows_per_request),
@@ -611,4 +798,5 @@ def consume_prefill_candidate_sparse(
             if raw_indices is not None:
                 raw_indices[offset:end, : indexer.index_topk] = selected
         offset = end
+    _log_consumer(backend, layer_id, q_fp4, k_cache)
     return True
