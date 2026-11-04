@@ -98,9 +98,9 @@ class _TrackedTensor:
     def __getitem__(self, key):
         return _TrackedTensor(self.value[key], self.harness)
 
-    def copy_(self, value):
+    def copy_(self, value, *, non_blocking=False):
         self.harness.record("copy")
-        self.value.copy_(value)
+        self.value.copy_(value, non_blocking=non_blocking)
         return self
 
 
@@ -193,8 +193,9 @@ class _Harness:
         self.namespace["get_pynccl_broadcast_comm"] = lambda: comm
         _load_nodes("staging.py", ["build_active_pages_mask", "all_reduce_active_pages_mask",
                     "active_pages_for_indices", "contiguous_request_page_capacity",
-                    "remap_indices_to_staging"], self.namespace)
-        for name, event in (("build_active_pages_mask", "build"),
+                    "_staging_page_map", "remap_indices_to_staging"], self.namespace)
+        for name, event in (("active_pages_for_indices", "select"),
+                            ("build_active_pages_mask", "build"),
                             ("remap_indices_to_staging", "remap")):
             function = self.namespace[name]
 
@@ -206,7 +207,7 @@ class _Harness:
         methods = ["_pool_num_pages", "_active_pages_for_indices",
                    "_compact_broadcast_for_read", "_extra_family_name",
                    "_clear_extra_read_state", "prefetch_low_ratio_extra_layer",
-                   "prefetch_swa_layer", "reset_batch_active_pages",
+                   "prefetch_swa_layer", "_swa_read_pool", "reset_batch_active_pages",
                    "_clear_swa_read_state", "_clear_indexer_read_state",
                    "clear_staging_remap_for_read", "prepare_forward",
                    "get_extra_key_buffer_for_write", "set_extra_key_buffer",
@@ -226,6 +227,7 @@ class _Harness:
                                  kv_buffer=[self.reference + 999, self.reference])
         self.pool.kv_pools = {1: kv_pool, 2: kv_pool}
         self.pool.swa_kv_pool = kv_pool
+        self.pool.get_swa_raw_buffer = lambda layer: self.reference
         self.pool.sliding_window = 128
         self.pool._swa_local_layer_id = lambda layer: 1
         self.pool._low_owner_local_by_source = {4: 1, 6: 1}
@@ -338,7 +340,7 @@ class TestLayerSplitAsyncPages(CustomTestCase):
                             8, indices, num_reqs=1, read_token_capacity=13
                         )
                         expected = torch.empty(0, dtype=torch.int32) if empty_consumer else torch.tensor(
-                            [2, 4, -1], dtype=torch.int32
+                            [8, 12, -1], dtype=torch.int32
                         )
                         torch.testing.assert_close(pool._extra_remapped_indices, expected)
                         torch.testing.assert_close(harness.staging.value, storage)
@@ -346,7 +348,7 @@ class TestLayerSplitAsyncPages(CustomTestCase):
                         self.assertEqual(pool._extra_staging_layer_id, 8)
                         self.assertEqual(pool._extra_remapped_layer_id, 8)
                         self.assertFalse(pool._broadcast_slots.pending("extra").active)
-                        for operation in ("build", "all_reduce", "broadcast"):
+                        for operation in ("select", "broadcast"):
                             self.assertEqual(sum(e[0] == operation for e in harness.events), 1)
                         self.assertIn(("wait", "main", "side1"), harness.events)
 
@@ -375,7 +377,7 @@ class TestLayerSplitAsyncPages(CustomTestCase):
                     self.assertEqual(sum(e[0] == "broadcast" for e in harness.events), before + 1)
                     torch.testing.assert_close(
                         pool._extra_remapped_indices,
-                        torch.tensor([0, 1, 2, 3, 4, -1], dtype=torch.int32),
+                        torch.tensor([2, 3, 8, 9, 12, -1], dtype=torch.int32),
                     )
 
     def test_sparse_subsets_dynamic_and_capture_do_not_cache_payload(self):
@@ -407,10 +409,10 @@ class TestLayerSplitAsyncPages(CustomTestCase):
                     9, indices, num_reqs=1, read_token_capacity=13
                 )
                 self.assertEqual(sum(e[0] == "broadcast" for e in harness.events), 2)
-                torch.testing.assert_close(harness.staging.value[:3], harness.reference[[1, 4, 6]])
+                torch.testing.assert_close(harness.staging.value, harness.reference)
                 torch.testing.assert_close(
                     pool._extra_remapped_indices,
-                    torch.tensor([0, 1, 2, 3, 4, -1], dtype=torch.int32),
+                    torch.tensor([2, 3, 8, 9, 12, -1], dtype=torch.int32),
                 )
 
     def test_helper_only_marks_uniform_full_history_source_reads(self):
@@ -445,7 +447,7 @@ class TestLayerSplitAsyncPages(CustomTestCase):
             for shape in ((8, 31), (8, 2, 3)):
                 for static in (False, True):
                     with self.subTest(dtype=dtype, shape=shape, static=static):
-                        harness = _Harness()
+                        harness = _Harness(enabled=False)
                         source = (
                             torch.arange(torch.tensor(shape).prod())
                             .reshape(shape)
@@ -499,20 +501,19 @@ class TestLayerSplitAsyncPages(CustomTestCase):
                             layer=layer, tail_lens=tail_lens, indices=indices,
                         )
                         selected = harness.pool._batch_active_pages["swa"].selected_pages
-                        torch.testing.assert_close(selected[:3], torch.tensor([1, 4, 6]))
-                        self.assertTrue(bool((selected[3:] == -1).all()))
+                        torch.testing.assert_close(selected, torch.arange(8))
                         self.assertIsNone(metadata.sparse_prefill_cache)
-                        self.assertIn(("nonzero_static", "main"), harness.events)
+                        self.assertIn(("select", "main"), harness.events)
                         self.assertFalse(any(e[0] == "nonzero" for e in harness.events))
                         expected = (
                             torch.empty(0, dtype=torch.int32) if empty_rank else
-                            torch.tensor([0, 1, 2, 3, -1], dtype=torch.int32)
+                            torch.tensor([2, 3, 8, 9, -1], dtype=torch.int32)
                         )
                         torch.testing.assert_close(harness.pool._swa_remapped_indices, expected)
                         torch.testing.assert_close(
-                            harness.staging.value[:3], harness.reference[[1, 4, 6]]
+                            harness.staging.value, harness.reference
                         )
-                        self.assertEqual(harness.events.count(("all_reduce", "main")), 1)
+                        self.assertEqual(harness.events.count(("all_reduce", "main")), 0)
                         self.assertEqual(harness.events.count(("broadcast", "side1")), 1)
                         harness.pool._broadcast_slots.finish("swa", layer)
                         self.assertEqual(harness.events[-1], ("wait", "main", "side1"))
@@ -568,31 +569,35 @@ class TestLayerSplitAsyncPages(CustomTestCase):
         cache = SimpleNamespace(swa_token_ids=torch.tensor([2, 3, 8, 9, 12, -1]),
                                 num_reqs=1)
         harness.fetch_swa(cache=cache)
-        self.assertIn(("nonzero_static", "main"), harness.events)
+        self.assertIn(("select", "main"), harness.events)
         selected = harness.pool._batch_active_pages["swa"].selected_pages
-        torch.testing.assert_close(selected[:3], torch.tensor([1, 4, 6]))
-        # A second layer reuses this selection instead of running nonzero again.
+        torch.testing.assert_close(selected, torch.arange(8))
+        # A second layer reuses this selection instead of building another table.
         harness.pool._broadcast_slots.finish("swa", 0)
         harness.fetch_swa(layer=1, cache=cache)
         self.assertIs(harness.pool._batch_active_pages["swa"].selected_pages, selected)
-        self.assertEqual(harness.events.count(("nonzero_static", "main")), 1)
+        self.assertEqual(harness.events.count(("select", "main")), 1)
 
-    def test_swa_disabled_request_window_and_legacy_call_keep_dynamic_fallback(self):
+    def test_swa_static_layout_includes_window_and_legacy_call(self):
         for options in ({"enabled": False}, {"window": 16}, {"legacy": True}):
             with self.subTest(options=options):
                 harness = _Harness(enabled=options.get("enabled", True), peer_pages=(6,))
-                harness.pool.request_window = options.get("window")
+                harness.pool.request_window = (
+                    SimpleNamespace(workspace=harness.pool.swa_kv_pool)
+                    if options.get("window") is not None else None
+                )
                 if options.get("legacy"):
                     harness.pool.prefetch_swa_layer(
                         0, torch.tensor([2, 3, 8, 9, -1], dtype=torch.int32)
                     )
                 else:
                     harness.fetch_swa()
-                self.assertIn(("nonzero", "main"), harness.events)
+                self.assertEqual(("nonzero", "main") in harness.events, not options.get("enabled", True))
                 self.assertFalse(any(e[0] == "nonzero_static" for e in harness.events))
                 torch.testing.assert_close(
                     harness.pool._swa_remapped_indices,
-                    torch.tensor([0, 1, 2, 3, -1], dtype=torch.int32),
+                    torch.tensor([2, 3, 8, 9, -1] if options.get("enabled", True)
+                                 else [0, 1, 2, 3, -1], dtype=torch.int32),
                 )
 
     def test_tail_without_chunk_cache_selects_static_pages_on_broadcast_slot(self):
@@ -605,16 +610,15 @@ class TestLayerSplitAsyncPages(CustomTestCase):
                         harness.pool.compression_ratios[layer]
                     )
                     selected = harness.pool._batch_active_pages[family].selected_pages
-                    torch.testing.assert_close(selected[:3], torch.tensor([1, 4, 6]))
-                    self.assertTrue(bool((selected[3:] == -1).all()))
+                    torch.testing.assert_close(selected, torch.arange(8))
                     torch.testing.assert_close(
                         harness.pool._extra_remapped_indices,
-                        torch.tensor([0, 1, 2, 3, -1], dtype=torch.int32),
+                        torch.tensor([2, 3, 8, 9, -1], dtype=torch.int32),
                     )
                     torch.testing.assert_close(
-                        harness.staging.value[:3], harness.reference[[1, 4, 6]]
+                        harness.staging.value, harness.reference
                     )
-                    self.assertIn(("nonzero_static", "side1"), harness.events)
+                    self.assertIn(("select", "side1"), harness.events)
                     self.assertFalse(any(e[0] == "nonzero" for e in harness.events))
                     self.assertIsNone(metadata.sparse_prefill_cache)
                     self.assertIsNotNone(metadata.late_layer_tail)
@@ -625,11 +629,11 @@ class TestLayerSplitAsyncPages(CustomTestCase):
         harness = _Harness(peer_pages=(1, 4, 6))
         harness.fetch_tail(indices=torch.empty(0, dtype=torch.int32))
         selected = harness.pool._batch_active_pages["extra_c1"].selected_pages
-        torch.testing.assert_close(selected[:3], torch.tensor([1, 4, 6]))
+        torch.testing.assert_close(selected, torch.arange(8))
         self.assertEqual(harness.pool._extra_remapped_indices.numel(), 0)
-        self.assertEqual(harness.events.count(("all_reduce", "side1")), 1)
+        self.assertEqual(harness.events.count(("all_reduce", "side1")), 0)
         self.assertEqual(harness.events.count(("broadcast", "side1")), 1)
-        self.assertIn(("nonzero_static", "side1"), harness.events)
+        self.assertIn(("select", "side1"), harness.events)
 
     def test_tail_history_bound_covers_fragmented_cp_page_union(self):
         for layer, ratio in ((8, 1), (9, 2)):
@@ -670,16 +674,20 @@ class TestLayerSplitAsyncPages(CustomTestCase):
                         self.assertTrue(bool((selected[pages:] == -1).all()))
                         self.assertLess(static_size, max_pages)
 
-    def test_tail_disabled_window_and_missing_metadata_keep_dynamic_fallback(self):
+    def test_tail_static_layout_without_shape_hint(self):
         for options in ({"enabled": False}, {"window": 16}, {"tail": False}):
             with self.subTest(options=options):
                 harness = _Harness(enabled=options.get("enabled", True), peer_pages=(6,))
-                harness.pool.request_window = options.get("window")
+                harness.pool.request_window = (
+                    SimpleNamespace(workspace=harness.pool.swa_kv_pool)
+                    if options.get("window") is not None else None
+                )
                 harness.fetch_tail(tail=options.get("tail", True))
-                self.assertIn(("nonzero", "main"), harness.events)
+                self.assertEqual(("nonzero", "main") in harness.events, not options.get("enabled", True))
                 torch.testing.assert_close(
                     harness.pool._extra_remapped_indices,
-                    torch.tensor([0, 1, 2, 3, -1], dtype=torch.int32),
+                    torch.tensor([2, 3, 8, 9, -1] if options.get("enabled", True)
+                                 else [0, 1, 2, 3, -1], dtype=torch.int32),
                 )
 
     def test_static_selection_copy_broadcast_and_remap_share_one_slot(self):
@@ -689,18 +697,19 @@ class TestLayerSplitAsyncPages(CustomTestCase):
                 harness.fetch(read_indices=torch.tensor([2, 3, 8, 9, -1, -1]))
                 events, pool = harness.events, harness.pool
                 torch.testing.assert_close(pool._extra_remapped_indices,
-                                           torch.tensor([0, 1, 2, 3, 4, -1], dtype=torch.int32))
-                torch.testing.assert_close(harness.staging.value[:3], harness.reference[[1, 4, 6]])
-                for operation in ("build", "all_reduce", "nonzero_static", "broadcast", "remap"):
+                                           torch.tensor([2, 3, 8, 9, 12, -1], dtype=torch.int32))
+                torch.testing.assert_close(harness.staging.value, harness.reference)
+                for operation in ("select", "broadcast", "remap"):
                     self.assertEqual([item for item in events if item[0] == operation],
                                      [(operation, "side1")])
                 self.assertEqual(events.count(("launch", "main")), 1)
                 self.assertEqual(events.count(("clear", "main")), 1)
                 self.assertFalse(any(item[0] == "start" for item in events))
                 self.assertIn(("owner", 0), events)  # Source layer 4 owns consumer layer 8.
-                self.assertEqual([item for item in events if item[0] == "gather_out"],
-                                 [("gather_out", "side1")] if rank == 0 else [])
-                self.assertFalse(any(item[0] == "copy" for item in events))
+                self.assertEqual([item for item in events if item[0] == "copy"],
+                                 [("copy", "side1")] if rank == 0 else [])
+                self.assertFalse(any(item[0] in ("build", "all_reduce", "nonzero",
+                                                 "nonzero_static", "gather_out") for item in events))
                 harness.record("independent_q")
                 self.assertTrue(pool._broadcast_slots.pending("extra").active)
                 pool._broadcast_slots.finish("extra", 8)
@@ -720,47 +729,49 @@ class TestLayerSplitAsyncPages(CustomTestCase):
                 harness.pool.request_window = request_window
                 harness.fetch(num_reqs=num_reqs)
                 events = harness.events
-                self.assertIn(("build", "main"), events)
-                self.assertIn(("all_reduce", "main"), events)
+                compact = not options.get("enabled", True)
+                self.assertEqual(("build", "main") in events, compact)
+                self.assertEqual(("all_reduce", "main") in events, compact)
                 self.assertIn(("start", "main"), events)
                 self.assertIn(("broadcast", "side1"), events)
                 self.assertIn(("remap", "main"), events)
-                selector = "nonzero_static" if options.get("graph") else "nonzero"
-                self.assertIn((selector, "main"), events)
+                self.assertEqual(("nonzero", "main") in events, compact)
+                self.assertNotIn(("nonzero_static", "main"), events)
+                expected = [0, 1, 2, 3, 4, -1] if compact else [2, 3, 8, 9, 12, -1]
                 torch.testing.assert_close(harness.pool._extra_remapped_indices,
-                                           torch.tensor([0, 1, 2, 3, 4, -1], dtype=torch.int32))
+                                           torch.tensor(expected, dtype=torch.int32))
 
-    def test_empty_rank_keeps_collectives_and_one_dummy_broadcast_page(self):
+    def test_empty_rank_still_broadcasts_full_pool(self):
         for rank in (0, 1):
             with self.subTest(rank=rank):
                 harness = _Harness(rank=rank)
                 empty = torch.empty(0, dtype=torch.int32)
                 harness.fetch(indices=empty, read_indices=empty, num_reqs=0)
                 self.assertEqual(harness.pool._extra_remapped_indices.numel(), 0)
-                self.assertEqual(harness.events.count(("all_reduce", "side1")), 1)
+                self.assertEqual(harness.events.count(("all_reduce", "side1")), 0)
                 self.assertEqual(harness.events.count(("broadcast", "side1")), 1)
                 self.assertEqual(harness.events.count(("launch", "main")), 1)
                 self.assertEqual(harness.events.count(("clear", "main")), 1)
                 self.assertTrue(harness.pool._broadcast_slots.pending("extra").active)
-                torch.testing.assert_close(harness.staging.value[:1], harness.reference[:1])
+                torch.testing.assert_close(harness.staging.value, harness.reference)
 
     def test_next_layer_drains_previous_slot_and_rebuilds_pages(self):
         harness = _Harness(rank=0)
         harness.fetch()
         harness.fetch(layer=9, indices=torch.tensor([0, 1, 6, -1], dtype=torch.int32))
         torch.testing.assert_close(harness.pool._extra_remapped_indices,
-                                   torch.tensor([0, 1, 2, -1], dtype=torch.int32))
+                                   torch.tensor([0, 1, 6, -1], dtype=torch.int32))
         selected = harness.pool._batch_active_pages["extra_c2"].selected_pages
-        torch.testing.assert_close(selected[:2], torch.tensor([0, 3]))
+        torch.testing.assert_close(selected, torch.arange(8))
         self.assertEqual(harness.pool._extra_remapped_layer_id, 9)
         self.assertEqual(harness.pool._extra_staging_layer_id, 9)
         self.assertEqual(harness.pool._broadcast_slots.pending("extra").layer_id, 9)
-        self.assertEqual(harness.events.count(("build", "side1")), 2)
-        self.assertEqual(harness.events.count(("all_reduce", "side1")), 2)
+        self.assertEqual(harness.events.count(("select", "side1")), 2)
+        self.assertEqual(harness.events.count(("all_reduce", "side1")), 0)
         self.assertEqual(harness.events.count(("wait", "main", "side1")), 1)
-        second_build = [i for i, event in enumerate(harness.events)
-                        if event == ("build", "side1")][1]
-        self.assertLess(harness.events.index(("wait", "main", "side1")), second_build)
+        second_selection = [i for i, event in enumerate(harness.events)
+                        if event == ("select", "side1")][1]
+        self.assertLess(harness.events.index(("wait", "main", "side1")), second_selection)
         self.assertIn(("owner", 1), harness.events)
 
 

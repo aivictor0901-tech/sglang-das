@@ -392,7 +392,8 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         static_size: Optional[int] = None,
     ) -> torch.Tensor:
         return active_pages_for_indices(
-            indices, page_size, max_pages, get_pynccl_broadcast_comm(), static_size
+            indices, page_size, max_pages, get_pynccl_broadcast_comm(), static_size,
+            full_static_layout=_USE_STATIC_CP_LAYER_SPLIT_PAGES,
         )
 
     def _compact_broadcast_for_read(
@@ -436,7 +437,12 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         owner_cp = self._get_layer_owner_rank(owner_layer_id)
         if self.cp_rank == owner_cp:
             assert source is not None
-            if active_pages > 0:
+            if _USE_STATIC_CP_LAYER_SPLIT_PAGES and active_pages > 0:
+                # Static selection uses the full physical page order. Copy the
+                # owner's KV directly into the already allocated device buffer.
+                assert active_pages == max_pages
+                staging[:active_pages].copy_(source[:active_pages], non_blocking=True)
+            elif active_pages > 0:
                 copy_pages = selected_pages
                 if selected_pages_static:
                     copy_pages = selected_pages.clamp_min(0)

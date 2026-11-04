@@ -132,8 +132,14 @@ def active_pages_for_indices(
     max_pages: int,
     pynccl_comm,
     static_size: Optional[int] = None,
+    *,
+    full_static_layout: bool = False,
 ) -> torch.Tensor:
     """Select pages touched by any CP rank; all ranks must call in the same order."""
+    if full_static_layout:
+        # In this layout a physical page has the same slot on every rank.
+        # The pool capacity is host-known metadata; no device scalar is read.
+        return torch.arange(max_pages, device=indices.device, dtype=torch.int64)
     local_mask = build_active_pages_mask(indices, page_size, max_pages)
     local_mask = all_reduce_active_pages_mask(local_mask, pynccl_comm)
     if static_size is not None:
