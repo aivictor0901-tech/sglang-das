@@ -40,7 +40,8 @@ import torch
 import triton
 
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import DIM_NOPE, DIM_ROPE
-from sglang.srt.utils import ceil_align
+from sglang.srt.environ import envs
+from sglang.srt.utils import ceil_align, is_hcu
 
 # FlashMLA sparse prefill asserts ``params.topk % B_TOPK == 0``. B_TOPK is 64
 # for the h_q=64 kernel and 128 for h_q=128; pad to 128 to satisfy both.
@@ -57,6 +58,16 @@ from sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels import (
     _combine_topk_swa_indices_kernel,
     _pack_compact_sparse_token_ids_kernel,
 )
+
+
+def _use_lightop_sparse_metadata() -> bool:
+    return is_hcu() and envs.SGLANG_DSV4_LIGHTOP_SPARSE_PREFILL_METADATA.get()
+
+
+def _lightop_sparse_metadata():
+    from lightop import dsv4_prefill
+
+    return dsv4_prefill
 
 
 def plan_c4_topk_workspace(
@@ -165,6 +176,11 @@ def build_cp_sparse_query_metadata(
     assert num_reqs > 0
     assert num_local_queries > 0
 
+    if _use_lightop_sparse_metadata():
+        return _lightop_sparse_metadata().dsv4_build_cp_sparse_query_metadata(
+            extend_seq_lens, extend_start_loc, query_positions, cp_size, cp_rank
+        )
+
     real_query_lens = torch.empty_like(extend_seq_lens)
     physical_query_lens = torch.empty_like(extend_seq_lens)
     sanitized_query_positions = torch.empty_like(query_positions)
@@ -255,6 +271,22 @@ def combine_topk_swa_indices(
         topk_indices.shape[-1] >= topk
     ), f"topk_indices width {topk_indices.shape[-1]} must be >= topk {topk}"
 
+    if _use_lightop_sparse_metadata():
+        return _lightop_sparse_metadata().dsv4_combine_topk_swa_indices(
+            topk_indices,
+            query_start_loc,
+            seq_lens,
+            gather_lens,
+            compressed_base,
+            swa_base,
+            window_size,
+            compress_ratio,
+            topk,
+            out_indices=out_indices,
+            out_lens=out_lens,
+            query_positions=query_positions,
+        )
+
     num_tokens = topk_indices.shape[0]
     num_reqs = seq_lens.shape[0]
     combined_topk = combined_topk_width(topk, window_size)
@@ -308,6 +340,9 @@ def build_swa_token_ids(
     full_to_swa: torch.Tensor,
     swa_window: int,
     total_swa: int,
+    *,
+    query_seq_lens: Optional[torch.Tensor] = None,
+    query_start_loc: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build a flat list of physical SWA-cache token IDs covering each
     request's positional union of every query's SWA window.
@@ -345,6 +380,24 @@ def build_swa_token_ids(
 
     num_reqs = seq_lens.shape[0]
     device = seq_lens.device
+
+    if _use_lightop_sparse_metadata():
+        return _lightop_sparse_metadata().dsv41_build_swa_token_ids(
+            seq_lens,
+            extend_seq_lens,
+            req_pool_indices,
+            req_to_token,
+            full_to_swa,
+            swa_window,
+            total_swa,
+            query_seq_lens=query_seq_lens,
+            query_start_loc=query_start_loc,
+        )
+    if query_seq_lens is not None:
+        if query_start_loc is None:
+            raise ValueError("query_start_loc must accompany query_seq_lens")
+        query_start_loc.zero_()
+        query_start_loc[1:] = torch.cumsum(query_seq_lens, dim=0, dtype=torch.int32)
 
     swa_gather_lens = torch.minimum(seq_lens, extend_seq_lens + (swa_window - 1)).to(
         torch.int32
@@ -477,8 +530,11 @@ class SparsePrefillChunkCache:
             assert query_positions.shape == (num_qo_tokens,)
             assert query_positions.device == device
 
-        query_start_loc = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
-        query_start_loc[1:] = torch.cumsum(query_seq_lens, dim=0).to(torch.int32)
+        native_metadata = _use_lightop_sparse_metadata()
+        query_start_loc = torch.empty(num_reqs + 1, dtype=torch.int32, device=device)
+        if not native_metadata:
+            query_start_loc.zero_()
+            query_start_loc[1:] = torch.cumsum(query_seq_lens, dim=0, dtype=torch.int32)
 
         swa_token_ids, swa_first_pos, swa_gather_lens, swa_offsets = (
             build_swa_token_ids(
@@ -489,6 +545,8 @@ class SparsePrefillChunkCache:
                 full_to_swa=full_to_swa,
                 swa_window=swa_window_size,
                 total_swa=total_swa,
+                query_seq_lens=query_seq_lens if native_metadata else None,
+                query_start_loc=query_start_loc if native_metadata else None,
             )
         )
 
@@ -553,6 +611,19 @@ class SparsePrefillChunkCache:
             raise ValueError(
                 "compact sparse-prefill workspace exceeds int32 index range"
             )
+        if _use_lightop_sparse_metadata():
+            (
+                flat_token_ids,
+                compressed_base,
+            ) = _lightop_sparse_metadata().dsv4_pack_compact_sparse_token_ids(
+                per_req_ids,
+                self.seq_lens,
+                compress_ratio,
+                page_size,
+                total_compressed,
+            )
+            return flat_token_ids, compressed_base, total_compressed
+
         compressed_lens = (self.seq_lens // compress_ratio).clamp_min(1)
         compressed_base = (
             torch.cumsum(compressed_lens, dim=0, dtype=torch.int32) - compressed_lens
@@ -598,9 +669,7 @@ class SparsePrefillChunkCache:
         if real_query_seq_lens is None:
             real_query_seq_lens = self.query_start_loc[1:] - self.query_start_loc[:-1]
         has_real_q = real_query_seq_lens > 0
-        last_real_q_per_req = (
-            self.query_start_loc[:-1] + real_query_seq_lens - 1
-        )
+        last_real_q_per_req = self.query_start_loc[:-1] + real_query_seq_lens - 1
         last_q_per_req = (
             torch.where(
                 has_real_q,
@@ -692,9 +761,7 @@ class SparsePrefillChunkCache:
         per_req_page_table = page_table.narrow(1, 0, num_blocks).index_select(
             0, first_q_per_req
         )
-        per_req_page_table = torch.where(
-            has_real_q[:, None], per_req_page_table, -1
-        )
+        per_req_page_table = torch.where(has_real_q[:, None], per_req_page_table, -1)
 
         if self.compact_seq_lens_cpu is None:
             k_arange = torch.arange(c4_max, dtype=torch.int32, device=device)

@@ -24,6 +24,13 @@ def _default_hip() -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=1)
+def _default_hcu() -> bool:
+    from sglang.srt.utils.common import is_hcu
+
+    return is_hcu()
+
+
 def _default_cache_subdir(name: str) -> str:
     """A directory under SGLANG_CACHE_DIR, for env defaults that track it.
 
@@ -1459,8 +1466,10 @@ class Envs:
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # HCU eager Prefill uses compact C4/C128 and SWA workspaces.
     # Decode workers and graph routes retain their existing paths.
-    # Opt in to dequantizing only the selected C4 TopK union within that layout.
-    SGLANG_DSV4_PREFILL_C4_TOPK_KV_WORKSPACE = EnvBool(False)
+    # HCU defaults to the selected C4 TopK union; explicit false retains the dense workspace.
+    SGLANG_DSV4_PREFILL_C4_TOPK_KV_WORKSPACE = EnvBool(_default_hcu)
+    # Native integer metadata; false is the retained Triton comparison path.
+    SGLANG_DSV4_LIGHTOP_SPARSE_PREFILL_METADATA = EnvBool(_default_hcu)
 
     # ===================================================================
     # DeepSeek V4 - cache, GEMM, and distributed
