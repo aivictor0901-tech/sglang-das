@@ -2553,7 +2553,12 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
 
             def _swa_payload():
-                window_size = self.sliding_window_size
+                kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+                window_size = (
+                    self.sliding_window_size
+                    if kvcache.request_window is None
+                    else kvcache.sliding_window
+                )
                 window_start = max(req.disagg_decode_prefix_len, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
                 cached = self.cached_disagg_page_indices(

@@ -185,6 +185,23 @@ def test_cache_linker_attachment_is_backend_independent():
     assert cache.linker.layer_done_counter is linker.layer_done_counter
 
 
+@pytest.mark.parametrize("has_swa_pool", [False, True])
+def test_cache_linker_respects_backend_swa_storage(has_swa_pool):
+    full, swa = object(), object()
+    cache = _cache_for_wrapper(
+        _components_tuple=(full, swa),
+        components={ComponentType.FULL: full, ComponentType.SWA: swa},
+        token_to_kv_pool_allocator=_swa_allocator(None),
+        tree_components=(ComponentType.FULL, ComponentType.SWA),
+    )
+    linker = _FakeLinker()
+    linker.pools = {PoolName.SWA: object()} if has_swa_pool else {PoolName.KV: object()}
+
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+
+    assert wrapper._components == ((full, swa) if has_swa_pool else (full,))
+
+
 @pytest.mark.parametrize("component_type", [ComponentType.MAMBA, ComponentType.C128])
 def test_cache_linker_rejects_unsupported_tree_components(component_type):
     cache = _cache_for_wrapper(tree_components=(ComponentType.FULL, component_type))
@@ -1099,7 +1116,9 @@ def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
     monkeypatch.setattr(env_gate, "is_unified_kv_triton", lambda: unified_kv)
     component = SWAComponent.__new__(SWAComponent)
     component.sliding_window_size = 128
+    component.gates_prefix_match = not unified_kv
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.decoder_swa_bounded_replay = False
     cache.token_to_kv_pool_allocator = _swa_allocator(swa_req_ring)
     cache.components = {ComponentType.SWA: component}
     cache.cache_controller = object() if enable_hicache else None
@@ -1337,6 +1356,121 @@ def test_linker_load_preserves_swa_boundaries(
     if not participates:
         swa.build_external_linker_transfer.assert_not_called()
         swa.update_external_linker_load.assert_not_called()
+
+
+@pytest.mark.parametrize("suffix_len", [0, 1, 2, 3, 4, 7, 8])
+@pytest.mark.parametrize(
+    "swa_storage", [None, False, True],
+    ids=["no-linker", "full-only", "persistent-swa"],
+)
+def test_checkpoint_preserves_full_only_prefix_at_page_boundary(
+    monkeypatch, suffix_len, swa_storage
+):
+    from sglang.srt.environ import envs
+    from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    # Exercise the real tree, request row and allocator on CPU. DMA descriptors
+    # are unused; the generic paged MHA test pool does not expose NHD buffers.
+    monkeypatch.setattr(shared_cache_suite, "get_device", lambda: "cpu")
+    monkeypatch.setattr(MHATokenToKVPool, "_build_kv_buffer_descs", lambda self: [])
+    cfg = CacheConfig(
+        page_size=4, components=(ComponentType.FULL, ComponentType.SWA),
+        sliding_window_size=4, num_layers=2, full_attention_layer_ids=(0,),
+        kv_size=64, max_context_len=32, head_num=1, head_dim=16,
+    )
+    cache, allocator, pool = build_fixture(cfg, tree_core_backend="python")
+    helper = shared_cache_suite.UnifiedRadixCacheSuite()
+    helper.cfg = cfg
+    req = helper._make_req(pool)
+    tokens = array("q", range(1, 9 + suffix_len))
+    indices = helper._alloc(allocator, len(tokens))
+    req.origin_input_ids = tokens
+    req.output_ids = []
+    req.full_untruncated_fill_ids = tokens
+    req.extend_end = len(tokens)
+    req.priority = 0
+    pool.write((req.kv.req_pool_idx, slice(0, len(tokens))), indices)
+    prefix_key = RadixKey(tokens[:8])
+    inserted = cache.insert(InsertParams(
+        key=prefix_key, value=indices[:8],
+        component_evicted_seqlens={ComponentType.SWA: 8}, inserted_len=8,
+    ))
+    req.last_node = inserted.last_device_node
+    req.lock = cache.lock(req.last_node)
+    req.kv.cache_protected_len = req.kv.cache_inserted_len = 8
+    req.kv.kv_committed_len = len(tokens)
+    req.kv.set_evicted_seqlen(ComponentType.SWA, 8)
+
+    # Normal admission still rejects missing SWA; checkpoint ownership must not
+    # re-run this validator or query the external store.
+    assert cache.match_prefix(MatchPrefixParams(key=prefix_key)).device_prefix_len == 0
+    backend = None
+    if swa_storage is not None:
+        backend = _FakeLinker()
+        backend.pools = {PoolName.KV: object()}
+        if swa_storage:
+            backend.pools[PoolName.SWA] = object()
+        backend.lookup = MagicMock(side_effect=AssertionError("checkpoint queried L3"))
+        cache.init_cache_linker(backend)
+        cache.tree_core.mark_external_cache_stored_path(
+            req.last_node, cache.root_node_handle()
+        )
+    with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(False):
+        cache.checkpoint(req, up_to=req.extend_end)
+
+    boundary = len(tokens) // cfg.page_size * cfg.page_size
+    assert req.kv.cache_protected_len == boundary
+    assert len(cache.path_device_indices(req.last_node)) == boundary
+    torch.testing.assert_close(
+        pool.req_to_token[req.kv.req_pool_idx, :len(tokens)].long(), indices.long()
+    )
+    if backend is not None:
+        backend.lookup.assert_not_called()
+    if suffix_len < cfg.page_size:
+        assert cache.match_prefix(MatchPrefixParams(key=prefix_key)).device_prefix_len == 0
+    cache.unlock(req.lock)
+    cache.sanity_check()
+
+
+@pytest.mark.parametrize("tail", [1, 127, 128, 202, 256])
+@pytest.mark.parametrize("bounded", [False, True])
+def test_bounded_replay_tail_is_kept_before_l1_and_l3_lookup(monkeypatch, tail, bounded):
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import env_gate
+    from sglang.srt.mem_cache.common import _req_radix_key
+
+    monkeypatch.setattr(env_gate, "is_unified_kv_triton", lambda: False)
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.components = {ComponentType.SWA: SimpleNamespace(sliding_window_size=128)}
+    cache.decoder_swa_bounded_replay = bounded
+    cache.tree_core = SimpleNamespace(is_eagle=False, has_swa_host_pool=False)
+    req = SimpleNamespace(extra_key=None, cache_salt="tail-control")
+    ids = array("q", range(4096 + tail))
+    key = _req_radix_key(cache, req, ids)
+    expected = len(ids) - (128 if bounded else 0)
+    assert len(key) == expected
+    boundary = len(key) // 256 * 256
+    if bounded:
+        assert len(ids) - boundary >= 128
+    else:
+        assert len(ids) - boundary == tail % 256
+
+
+@pytest.mark.parametrize("gates", [False, True])
+def test_transient_swa_matching_does_not_weaken_persistent_swa(gates):
+    cache = _cache_for_wrapper(token_to_kv_pool_allocator=_swa_allocator(False))
+    component = SWAComponent.__new__(SWAComponent)
+    component.cache = cache
+    component.sliding_window_size = 128
+    component.gates_prefix_match = gates
+    node = SimpleNamespace(
+        component_data={ComponentType.SWA: SimpleNamespace(value=None, host_value=None)},
+        backuped=False, evicted=False,
+    )
+    validator = component.create_match_validator(match_device_only=True)
+    assert validator(node) is (not gates)
+    node.evicted = True
+    assert validator(node) is False
 
 
 if __name__ == "__main__":

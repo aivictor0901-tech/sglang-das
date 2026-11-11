@@ -7,6 +7,14 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def supports_encoder_swa_replay_images() -> bool:
+    """Allow images on the supported CUDA/HCU eager replay paths."""
+    from sglang.srt.runtime_context import get_platform
+    from sglang.srt.utils import is_hcu
+
+    return get_platform().is_cuda or is_hcu()
+
+
 def run_encoder_swa_replay(worker, batch):
     from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
@@ -73,6 +81,8 @@ def run_encoder_swa_replay(worker, batch):
         replay.prefix_lens = [start]
         replay.extend_lens = [end - start]
         replay.extend_num_tokens = end - start
+        # A standalone replay must not inherit parent-batch CP row counts.
+        replay.global_cp_num_tokens = None
         if batch.global_num_tokens is not None:
             # Replay is a separate single-request forward. Parent-batch counts
             # can be smaller than its input (negative padding) or much larger.
@@ -97,7 +107,10 @@ def run_encoder_swa_replay(worker, batch):
         replay.spec_info = None
         replay.sampling_info = None
         replay.has_grammar = False
-        replay.multimodal_inputs = [None]
+        # Retain absolute image spans and cached features for this request.
+        # Embedding happens on the global rows before the normal CP shard.
+        mm_inputs = getattr(batch, "multimodal_inputs", None)
+        replay.multimodal_inputs = [mm_inputs[i]] if mm_inputs is not None else [None]
         replay.input_embeds = None
         replay.replace_embeds = None
         replay.replace_positions = None
@@ -107,7 +120,7 @@ def run_encoder_swa_replay(worker, batch):
             n = hasher.max_ngram_size - 1
             ids = list(req.full_untruncated_fill_ids[max(0, start - n) : start])
             replay.engram_history = torch.tensor(
-                [[0] * (n - len(ids)) + ids],
+                [hasher.history_row(ids)],
                 dtype=torch.int32,
                 device=runner.device,
             )

@@ -1296,7 +1296,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> List[int]:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
-
         max_new_tokens = obj.sampling_params.get("max_new_tokens") or 1
         input_ids = input_ids or []
         if max_new_tokens >= self.context_len:
@@ -1340,6 +1339,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
         # FIXME: unify the length validation logic with the one in the scheduler.
+        if get_exec().features.enable_encoder_swa_bounded_replay:
+            from sglang.srt.model_executor.encoder_swa_replay import (
+                supports_encoder_swa_replay_images,
+            )
+
+            if obj.image_data is not None and not supports_encoder_swa_replay_images():
+                raise ValueError(
+                    "encoder SWA replay supports image requests only on CUDA or HCU"
+                )
+            if any(
+                value is not None
+                for value in (
+                    obj.video_data,
+                    obj.audio_data,
+                    obj.input_embeds,
+                    obj.positional_embed_overrides,
+                )
+            ):
+                raise ValueError(
+                    "encoder SWA replay does not support video, audio, input embeddings, "
+                    "or positional embedding overrides"
+                )
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens

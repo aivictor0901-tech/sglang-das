@@ -154,7 +154,11 @@ from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers import (
     maybe_prepare_cp_cache_layer_split_forward,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -1993,6 +1997,13 @@ class DeepseekV4AttnBackend(
             return False
         if forward_batch.forward_mode != ForwardMode.EXTEND:
             return False
+        # A later prompt-logprob/full-hidden reader can require the previous
+        # chunk's SWA rows; keep its rolling history even before that transition.
+        if forward_batch.return_logprob or (
+            forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
+            and not self.model_runner.spec_algorithm.is_dspark()
+        ):
+            return False
         orig_lens = forward_batch.orig_seq_lens_cpu
         extend_lens = forward_batch.extend_seq_lens_cpu
         seq_lens = forward_batch.seq_lens_cpu
@@ -2049,7 +2060,7 @@ class DeepseekV4AttnBackend(
             cp_metadata=cp_tail["cp_metadata"] if cp_tail is not None else None,
         )
         swa_out_cache_loc = (
-            metadata.core_attn_metadata.request_window_layout.write_loc
+            metadata.core_attn_metadata.swa_out_cache_loc
             if self.token_to_kv_pool.request_window is not None
             else self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
                 torch.int32

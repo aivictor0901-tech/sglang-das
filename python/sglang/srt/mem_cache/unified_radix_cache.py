@@ -178,6 +178,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.disable = params.disable
+        self.decoder_swa_bounded_replay = params.decoder_swa_bounded_replay
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -1223,26 +1224,19 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             )
 
-        # Match prefix. SWA insertion retains one extra window before the
-        # page-aligned boundary, so the normal match remains safe to repoint.
-        # DSV4 prompt donation deliberately creates a full-only leaf whose SWA
-        # component is a tombstone, so it repoints by full-attention residency.
-        match_result = self._match_tree(
-            MatchPrefixParams(
-                key=radix_key,
-                req=req,
-                return_full_match=getattr(req, "force_radix_leaf_creation", False),
-            )
-        )
-        new_last_node = match_result.last_device_node
+        # Repoint to the canonical path the insert owns. An L3-loaded prefix
+        # can have only Full KV: if a short suffix stays below the next page,
+        # a fresh SWA match rejects that path and loses already protected KV.
+        # Prefix-reuse validation belongs to admission, not this ownership step.
+        new_last_node = result.last_device_node
         new_indices = self.path_device_indices(new_last_node)
         new_prefix_len = result.prefix_len
         assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
             f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
         )
-        assert new_prefix_len <= len(new_indices), (
-            f"{new_prefix_len=}, {len(new_indices)=}"
-        )
+        assert (
+            new_prefix_len <= len(new_indices) and len(new_indices) == page_aligned_len
+        ), f"{new_prefix_len=}, {len(new_indices)=}, {page_aligned_len=}"
         self.req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
             new_indices[req.kv.cache_protected_len :],
@@ -3615,15 +3609,19 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def swa_reprefill_tail_tokens(self) -> int:
         """
-        Only unified_kv needs this: SWA lives in a per-request ring
+        With decoder bounded replay, a reused prefix may lack late-layer SWA.
+        Keep a full window for re-prefill before the next sampled token. The
+        feature branch's existing no-argument API conservatively applies this
+        to every reuse, including sessions.
+
+        unified_kv also needs this: SWA lives in a per-request ring
         (state_slot/pos), not content-stable and never stored in the tree, so a
         reused prefix's trailing sliding window would read another request's
         stale ring slots. Re-prefilling that window rewrites this request's ring.
 
         Applies to plain radix reuse as well as HiCache -- the ring is stale
-        either way. Returns 0 once SWA has a host pool to restore exact contents
-        from, and for every non-unified_kv layout, whose SWA slots are
-        content-stable.
+        either way. Without decoder bounded replay, a host SWA pool or a
+        content-stable non-unified_kv layout needs no tail re-prefill.
         """
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -3632,6 +3630,8 @@ class UnifiedRadixCache(BasePrefixCache):
         swa = self.components.get(ComponentType.SWA)
         if swa is None or not swa.sliding_window_size:
             return 0
+        if self.decoder_swa_bounded_replay:
+            return swa.sliding_window_size
         if not is_unified_kv_triton():
             return 0
         if self.tree_core.has_swa_host_pool:

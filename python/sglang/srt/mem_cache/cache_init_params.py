@@ -48,6 +48,11 @@ class CacheInitParams:
 
     sliding_window_size: Optional[int] = None
 
+    # Request-local target windows / draft-only paged SWA are not reusable
+    # tree state. Decoder bounded replay also needs a freshly computed tail.
+    swa_gates_prefix_match: bool = True
+    decoder_swa_bounded_replay: bool = False
+
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None
 

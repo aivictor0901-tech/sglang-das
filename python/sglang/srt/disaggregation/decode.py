@@ -2093,7 +2093,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ]
 
             def _swa_payload():
-                window_size = self.scheduler.sliding_window_size
+                request_window = getattr(self.token_to_kv_pool, "request_window", None)
+                window_size = (
+                    self.scheduler.sliding_window_size
+                    if request_window is None
+                    else self.token_to_kv_pool.sliding_window
+                )
                 window_start = max(total_prefix_len, seq_len - window_size)
                 window_start = page_align_floor(window_start, page_size)
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[

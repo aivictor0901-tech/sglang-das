@@ -111,6 +111,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
+        storage_layout_tag = getattr(self.pool_group, "storage_layout_tag", "")
+        # The tree wrapper owns collective ordering, including failures.
+        self.requires_load_revalidation_consensus = bool(storage_layout_tag)
 
         tp_rank = 0
         tp_size = get_parallel().tp_size
@@ -155,6 +158,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             attn_cp_rank=params.attn_cp_rank,
             pp_rank=params.pp_rank,
         )
+        if storage_layout_tag:
+            storage_suffix = f"{storage_layout_tag}_cp{params.attn_cp_size}_{storage_suffix}"
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
         logger.info(
@@ -246,6 +251,59 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 len(restorable),
             )
         return restorable
+
+    def revalidate_load(self, transfers: list[PoolTransfer]) -> bool:
+        return self._revalidate_load_local(transfers)
+
+
+    def _revalidate_load_local(self, transfers: list[PoolTransfer]) -> bool:
+        """Re-check remote existence before the scheduler commits device
+        slots to the async layer-wise load.
+
+        The match-time lookup and ``batch_get_session_start`` can be minutes
+        apart; master-side memory-watermark eviction in that window expires
+        replicas and would fail the layer-wise load fatally. Re-checking here
+        lets the caller degrade the request to a plain cache miss instead.
+
+        An unavailable or malformed existence response is a cache miss. The
+        tree wrapper agrees on the verdict before any rank enters the load.
+        """
+        try:
+            resolved = self.pool_group.resolve_transfers(
+                transfers, allow_partial=True, allow_missing_kv=True
+            )
+            if not resolved:
+                return True
+            key_strs: list[str] = []
+            for transfer in resolved:
+                component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                    list(transfer.keys), transfer
+                )
+                key_strs.extend(self.storage._tag_keys(component_keys))
+            if not key_strs:
+                return True
+            exist = self.storage._batch_exist(key_strs)
+        except Exception:
+            logger.exception("Mooncake direct linker load revalidation error")
+            return False
+        if exist is None or len(exist) != len(key_strs):
+            logger.warning("Mooncake direct linker existence response length mismatch")
+            return False
+        missing = [key for key, state in zip(key_strs, exist) if state != 1]
+        if missing:
+            logger.warning(
+                "Mooncake direct linker load revalidation failed: "
+                "missing=%d/%d keys (master eviction race), "
+                "degrading request to cache miss",
+                len(missing),
+                len(key_strs),
+            )
+            failed_get_cache = getattr(self.storage, "failed_get_cache", None)
+            if failed_get_cache is not None:
+                failed_get_cache.update_batch([], missing)
+            return False
+        return True
+
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         # Query establishes a boundary at which every component is restorable;

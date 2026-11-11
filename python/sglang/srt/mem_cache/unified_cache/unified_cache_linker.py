@@ -19,6 +19,7 @@ The tree only needs a handful of guarded hooks:
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
@@ -48,6 +49,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+
+logger = logging.getLogger(__name__)
 
 
 _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
@@ -162,8 +166,11 @@ class UnifiedCacheLinkerWrapper:
         self.cache = cache
         self.cache_linker = cache_linker
         swa = cache.components.get(ComponentType.SWA)
-        self._skip_swa = swa is not None and is_swa_req_ring(
-            cache.token_to_kv_pool_allocator
+        pools = getattr(cache_linker, "pools", None)
+        self._skip_swa = swa is not None and (
+            PoolName.SWA not in pools
+            if pools is not None
+            else is_swa_req_ring(cache.token_to_kv_pool_allocator)
         )
         self._components = tuple(
             component
@@ -212,8 +219,15 @@ class UnifiedCacheLinkerWrapper:
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
+        try:
+            restorable = self.cache_linker.lookup(req.rid, lookup_transfers)
+        except Exception:
+            if not self._requires_load_consensus():
+                raise
+            logger.exception("External linker lookup failed; agreeing on a cache miss")
+            restorable = []
         hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
+            restorable,
             num_pages=len(tail_hashes),
             device_hit_pages=0,
         )
@@ -287,6 +301,12 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- init_load_back: remote -> device, then insert ----
 
+    def _requires_load_consensus(self) -> bool:
+        return (
+            getattr(self.cache_linker, "requires_load_revalidation_consensus", False)
+            is True
+        )
+
     def load_back(self, req: Req) -> tuple[int, NodeId]:
         cache = self.cache
         hit = self.hit_markers.pop(req.rid, None)
@@ -299,19 +319,50 @@ class UnifiedCacheLinkerWrapper:
 
         # Build per-component linker transfers.
         component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
+        constructed = True
         for component in self._components:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOAD, None, tail_hashes
-            )
+            try:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOAD, None, tail_hashes
+                )
+            except Exception:
+                if not self._requires_load_consensus():
+                    raise
+                logger.exception("External linker transfer construction failed")
+                transfer = None
             if transfer is None:
+                constructed = False
+                break
+            component_transfers.append((component, transfer))
+
+        if self._requires_load_consensus():
+            verdict = torch.tensor(int(constructed), dtype=torch.int)
+            cache._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
+            constructed = bool(verdict.item())
+        if not constructed:
+            self._update_load(
+                ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
+            )
+            return 0, req.last_node
+
+        revalidate = getattr(self.cache_linker, "revalidate_load", None)
+        if revalidate is not None:
+            if self._requires_load_consensus():
+                try:
+                    valid = bool(revalidate([t for _, t in component_transfers]))
+                except Exception:
+                    logger.exception("External linker revalidation failed on this rank")
+                    valid = False
+                verdict = torch.tensor(int(valid), dtype=torch.int)
+                cache._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
+                valid = bool(verdict.item())
+            else:
+                valid = revalidate([t for _, t in component_transfers])
+            if not valid:
                 self._update_load(
-                    ExternalLinkerLoadPhase.ABORT,
-                    req,
-                    component_transfers,
-                    prefix_len,
+                    ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
                 )
                 return 0, req.last_node
-            component_transfers.append((component, transfer))
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV

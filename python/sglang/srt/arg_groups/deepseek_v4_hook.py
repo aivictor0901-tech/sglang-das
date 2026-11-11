@@ -254,6 +254,12 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             and cfg.disaggregation_mode in ("prefill", "decode")
             and cfg.disaggregation_transfer_backend == "mooncake"
         )
+        hcu_mooncake_linker_replay = (
+            hcu_layer_split_replay
+            and hcu_pd_replay
+            and cfg.attn_cp_size == 8
+            and cfg.unified_cache_external_linker_backend == "mooncake"
+        )
         incompatible = (
             (
                 "hardware other than CUDA, gfx950 or HCU",
@@ -275,7 +281,11 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "context parallelism without HCU interleave LayerSplit",
                 cfg.attn_cp_size > 1 and not hcu_layer_split_replay,
             ),
-            ("external cache linker", cfg.enable_unified_cache_external_linker),
+            (
+                "external cache linker",
+                cfg.enable_unified_cache_external_linker
+                and not hcu_mooncake_linker_replay,
+            ),
             ("unified memory", cfg.enable_unified_memory),
             (
                 "PD disaggregation outside the HCU Mooncake path",

@@ -2784,14 +2784,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.loc_tensor = torch.full((1,), -1, dtype=torch.int64, device=self.device)
 
         if get_exec().features.enable_encoder_swa_bounded_replay:
+            from sglang.srt.model_executor.encoder_swa_replay import (
+                supports_encoder_swa_replay_images,
+            )
+
             for req in reqs:
+                if req.multimodal_inputs is not None and (
+                    not supports_encoder_swa_replay_images()
+                    or any(
+                        item.modality != Modality.IMAGE
+                        for item in req.multimodal_inputs.mm_items
+                    )
+                ):
+                    raise ValueError(
+                        "encoder SWA replay supports multimodal inputs only for "
+                        "image requests on CUDA or HCU"
+                    )
                 if (
-                    req.multimodal_inputs is not None
-                    or req.input_embeds is not None
+                    req.input_embeds is not None
                     or req.positional_embed_overrides is not None
                 ):
                     raise ValueError(
-                        "encoder SWA replay currently supports token-only text requests"
+                        "encoder SWA replay does not support input embeddings or "
+                        "positional embedding overrides"
                     )
                 if req.return_logprob and req.logprob_start_len not in (
                     -1,

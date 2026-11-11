@@ -37,6 +37,7 @@ from sglang.srt.configs.hybrid_arch import (
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
+from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -298,6 +299,16 @@ def build_kv_cache(
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
     mtp_draft_device_pools = tp_worker.model_runner.mtp_draft_device_pools
 
+    # The target's request window owns its SWA state; the paged SWA pool beside
+    # it is draft-only and must not reject an otherwise resident Full prefix.
+    swa_gates_prefix_match = not (
+        is_swa_req_ring(token_to_kv_pool_allocator)
+        or (
+            isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            and token_to_kv_pool.request_window is not None
+        )
+    )
+
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
 
     disable_radix_cache = get_memory().disable_radix_cache or (
@@ -392,6 +403,8 @@ def build_kv_cache(
         attn_cp_size=parallel.attn_cp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
+        swa_gates_prefix_match=swa_gates_prefix_match,
+        decoder_swa_bounded_replay=get_exec().features.enable_decoder_swa_bounded_replay,
         mtp_draft_device_pools=mtp_draft_device_pools,
     )
 
