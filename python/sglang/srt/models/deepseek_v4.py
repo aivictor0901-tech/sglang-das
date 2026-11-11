@@ -5730,6 +5730,17 @@ class DeepseekV4ForCausalLM(nn.Module):
                 layer.bind_next(layers[i + 1] if i + 1 < len(layers) else None)
 
     def precompile_kernels_after_loading(self) -> None:
+        if (
+            _is_hcu
+            and self.config.model_type == "deepseek_v41"
+            and envs.SGLANG_HCU_DSV41_STARTUP_JIT_WARMUP.get()
+        ):
+            from sglang.srt.model_executor.hcu_dsv41_jit_warmup import (
+                prewarm_hcu_dsv41_kernels,
+            )
+
+            prewarm_hcu_dsv41_kernels(self)
+
         from sglang.srt.layers.moe.mega_moe import (
             build_mega_moe_shared_weights,
             should_fuse_mega_moe_shared_experts,

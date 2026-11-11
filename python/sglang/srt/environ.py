@@ -1089,6 +1089,9 @@ class Envs:
     SGLANG_DSV4_PD_PREFILL_USE_FULL_TOKEN_POOL = EnvBool(True)
     SGLANG_ENABLE_DP_ATTENTION_LOCAL_CONTROL_BROADCAST = EnvBool(False)
     SGLANG_KV_LAYOUT_HCU_FA = EnvBool(True)
+    # Prime the known V4.1 store/hash/vision Triton cold compiles before Ready.
+    # Temporary tensors are released before KV sizing. Set 0 to diagnose startup.
+    SGLANG_HCU_DSV41_STARTUP_JIT_WARMUP = EnvBool(True)
     SGLANG_USE_LIGHTOP = EnvBool(False)
     # Use fused HCU BF16 routing when the backend and inputs are supported.
     SGLANG_HCU_ENABLE_DSV41_BF16_MEGA_GATE = EnvBool(True)
