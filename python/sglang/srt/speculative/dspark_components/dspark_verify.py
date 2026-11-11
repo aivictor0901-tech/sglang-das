@@ -149,6 +149,7 @@ class TargetVerifyExecutor:
         bs: int,
         verify_ids_2d: torch.Tensor,
         target_logits: Optional[torch.Tensor],
+        target_token_ids: Optional[torch.Tensor] = None,
         draft_block: DraftBlockResult,
         sampling_info,
         draft_input: DFlashDraftInputV2,
@@ -174,6 +175,7 @@ class TargetVerifyExecutor:
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
             candidates=verify_ids_2d,
             target_logits=target_logits,
+            target_token_ids=target_token_ids,
             draft_block=draft_block,
             sampling_info=accept_sampling_info,
             draft_input=draft_input,
@@ -873,6 +875,7 @@ def accept_draft_tokens(
     *,
     candidates: torch.Tensor,
     target_logits: torch.Tensor,
+    target_token_ids: Optional[torch.Tensor] = None,
     draft_block: DraftBlockResult,
     sampling_info,
     draft_input: DFlashDraftInputV2,
@@ -882,6 +885,22 @@ def accept_draft_tokens(
     fused_argmax: bool = False,
     block_verification: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if target_token_ids is not None:
+        if sampling_info is not None and not sampling_info.is_all_greedy:
+            raise ValueError(
+                "Compact VP target winners cannot serve stochastic acceptance."
+            )
+        return AcceptGreedy.execute(
+            candidates=candidates,
+            target_logits=target_logits,
+            target_token_ids=target_token_ids[
+                : candidates.shape[0] * verify_num_draft_tokens
+            ],
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            cutoff_verify_lens=None
+            if cutoff_layout is None
+            else cutoff_layout.verify_lens,
+        )
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
     all_greedy = sampling_info is None or sampling_info.is_all_greedy

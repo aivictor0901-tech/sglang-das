@@ -590,7 +590,9 @@ class DSparkV4MarkovHead(nn.Module):
             ),
         ):
             if weight is not None:
-                raise ValueError("Quantized Markov slices require matching scale offsets")
+                raise ValueError(
+                    "Quantized Markov slices require matching scale offsets"
+                )
             dtype = torch.bfloat16 if self._opt_markov_w2_bf16 else torch.float32
             return self.markov_w2.quant_method.apply(
                 self.markov_w2, latent_states.to(dtype)
@@ -599,6 +601,45 @@ class DSparkV4MarkovHead(nn.Module):
         if self._opt_markov_w2_bf16:
             return F.linear(latent_states.to(weight.dtype), weight).float()
         return F.linear(latent_states.float(), weight)
+
+    def step_bias_vocab_slice(self, prev_tokens, start: int, end: int):
+        """The served Markov projection, restricted to one VP vocabulary slice."""
+        from sglang.srt.speculative.dspark_vp_greedy import markov_has_full_vocab
+
+        if not markov_has_full_vocab(self):
+            raise ValueError("Greedy VP requires an unsharded Markov source weight.")
+        latent = self.get_prev_embeddings(prev_tokens)
+        layer = self.markov_w2
+        weight = layer.weight[start:end].contiguous()
+        if isinstance(
+            getattr(layer, "quant_method", None), channelwise_int8.ChannelwiseInt8Method
+        ):
+            from sglang.srt.speculative.dspark_vp_greedy import int8_bias_slice
+
+            return int8_bias_slice(
+                latent.to(
+                    torch.bfloat16 if self._opt_markov_w2_bf16 else torch.float32
+                ),
+                weight,
+                layer.weight_scale[start:end].contiguous(),
+                output_dtype=torch.bfloat16
+                if self._opt_markov_w2_bf16
+                else torch.float32,
+            ).float()
+        if isinstance(
+            getattr(layer, "quant_method", None), channelwise_fp8.ChannelwiseFp8Method
+        ):
+            return channelwise_fp8.linear(
+                latent.to(
+                    torch.bfloat16 if self._opt_markov_w2_bf16 else torch.float32
+                ),
+                weight,
+                layer.weight_scale_inv[start:end].contiguous(),
+                output_dtype=torch.bfloat16
+                if self._opt_markov_w2_bf16
+                else torch.float32,
+            ).float()
+        return self.project_bias(latent, weight=weight)
 
     def compute_step_bias(
         self, token_ids: torch.Tensor, hidden_states: Optional[torch.Tensor]
@@ -1116,13 +1157,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             markov_rank=int(dspark_config.markov_rank),
             is_dsv41=getattr(config, "model_type", None) == "deepseek_v41",
         )
-        if (
-            getattr(config, "model_type", None) == "deepseek_v41"
-            and channelwise_int8.enabled(
-                self.markov_head.markov_w2,
-                quant_config,
-                add_prefix("markov_head.head", prefix),
-            )
+        if getattr(
+            config, "model_type", None
+        ) == "deepseek_v41" and channelwise_int8.enabled(
+            self.markov_head.markov_w2,
+            quant_config,
+            add_prefix("markov_head.head", prefix),
         ):
             channelwise_int8.install(self.markov_head.markov_w2)
         if channelwise_fp8.enabled(quant_config):

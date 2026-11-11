@@ -16,11 +16,15 @@ def _sharded_greedy_partial_kernel(
     OFFSET: tl.constexpr,
     PARTS: tl.constexpr,
     BLOCK: tl.constexpr,
+    HAS_BIAS: tl.constexpr = True,
 ):
     row, part = tl.program_id(0), tl.program_id(1)
     i = part * BLOCK + tl.arange(0, BLOCK)
     valid = i < WIDTH
-    bias = tl.load(B + row * BS + i, valid, 0).to(tl.float32)
+    if HAS_BIAS:
+        bias = tl.load(B + row * BS + i, valid, 0).to(tl.float32)
+    else:
+        bias = 0.0
     base = tl.load(X + row * XS + i, valid, 0).to(tl.float32)
     value = base + bias
     nan = valid & (value != value)

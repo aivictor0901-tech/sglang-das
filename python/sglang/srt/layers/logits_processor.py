@@ -217,6 +217,8 @@ class LogitsProcessorOutput:
     # The logits of the next tokens.       shape: [#seq, vocab_size]
     # Can be None for certain prefill-only requests (e.g., multi-item scoring) that don't need next token generation
     next_token_logits: Optional[torch.Tensor]
+    # Greedy DSPARK VP: exact global winners; next_token_logits is compact scores.
+    target_top1_token_ids: Optional[torch.Tensor] = None
     draft_top1_token_ids: Optional[torch.Tensor] = None
     draft_top1_probs: Optional[torch.Tensor] = None
     # Used by speculative decoding (EAGLE)
@@ -606,6 +608,32 @@ class LogitsProcessor(nn.Module):
             logits_metadata,
         )
         del hidden_states
+
+        from sglang.srt.speculative.dspark_vp_greedy import enabled
+
+        if enabled() and self.target_lm_head_vp is not None:
+            if logits_metadata.extend_return_logprob or self.return_full_logits:
+                raise ValueError("Greedy VP top-1 cannot produce full logits/logprobs.")
+            if self.logit_scale is not None or self.final_logit_softcapping:
+                raise ValueError(
+                    "Greedy VP top-1 requires an unscaled, uncapped target head."
+                )
+            if self.do_tensor_parallel_all_gather_dp_attn:
+                raise ValueError("Greedy VP top-1 requires DP-local head input rows.")
+            vp = self.target_lm_head_vp
+            capturing = (
+                pruned_states.is_cuda and torch.cuda.is_current_stream_capturing()
+            )
+            values, ids = vp.project_top1(
+                pruned_states.to(vp.dtype),
+                padded_rows=pruned_states.shape[0] if capturing else None,
+            )
+            return LogitsProcessorOutput(
+                next_token_logits=values.unsqueeze(-1),
+                target_top1_token_ids=ids,
+                hidden_states=hidden_states_to_store,
+                mm_input_embeds=logits_metadata.mm_input_embeds,
+            )
 
         if not logits_metadata.extend_return_logprob:
             if (

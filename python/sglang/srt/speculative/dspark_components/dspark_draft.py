@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
+from sglang.srt.speculative.dspark_vp_greedy import enabled as greedy_vp_enabled
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
     spec_scale_global_num_tokens,
@@ -280,7 +281,7 @@ class DraftBlockProposer:
         confidence_tap = None
         folded = False
         if (
-            envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
+            (envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get() or greedy_vp_enabled())
             and draft_sampler is not None
             and fwd.can_run_graph
             and (all_greedy or draft_sampler.folded_sampling)
@@ -321,6 +322,33 @@ class DraftBlockProposer:
             )
             if draft_sampler.confidence_out is not None:
                 folded_confidence = draft_sampler.confidence_out[:bs]
+        elif greedy_vp_enabled():
+            from sglang.srt.speculative.dspark_vp_greedy import draft_block
+
+            with self._base_logits_context():
+                tokens = draft_block(
+                    self.draft_model,
+                    fwd.raw_hidden,
+                    draft_block_ids[:, 0],
+                    gamma=self.gamma,
+                )
+                confidence_tap = self.draft_model.collapse_hc_head(fwd.raw_hidden)
+            greedy_mask = resolve_greedy_mask(
+                bs=bs, sampling_info=sampling_info, device=device
+            )
+            temperatures = (
+                torch.ones(bs, dtype=torch.float32, device=device)
+                if sampling_info is None
+                else sampling_info.temperatures.view(-1)
+                .to(torch.float32)
+                .clamp_min(1e-5)
+            )
+            draft_block = DraftBlockResult(
+                draft_tokens=tokens,
+                corrected_logits=None,
+                greedy_mask=greedy_mask,
+                temperatures=temperatures,
+            )
         else:
             with self._base_logits_context():
                 draft_vp = getattr(self.draft_model, "draft_lm_head_vp", None)
@@ -395,7 +423,17 @@ class DraftBlockProposer:
             if draft_vp is not None and not (
                 self._draft_sampler is not None and draft_out.can_run_graph
             ):
-                draft_vp.project_logits(draft_vp.local_hidden[:0])
+                from sglang.srt.speculative.dspark_vp_greedy import draft_block, enabled
+
+                if enabled():
+                    draft_block(
+                        self.draft_model,
+                        draft_vp.local_hidden[:0],
+                        empty_long,
+                        gamma=self.gamma,
+                    )
+                else:
+                    draft_vp.project_logits(draft_vp.local_hidden[:0])
 
     def _run_forward(
         self,

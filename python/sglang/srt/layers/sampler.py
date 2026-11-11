@@ -8,7 +8,6 @@ from torch import nn
 
 from sglang.kernels.ops.sampling import softmax as sampler_softmax
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -156,6 +155,22 @@ class Sampler(nn.Module):
             positions: The positions of the tokens in the sequence. Used for deterministic sampling
                 to get the unique seed for each position.
         """
+        if logits_output.target_top1_token_ids is not None:
+            from sglang.srt.speculative.dspark_components.dspark_verify import (
+                verify_logits_adjustments_are_noop,
+            )
+
+            if (
+                return_logprob
+                or not sampling_info.is_all_greedy
+                or not verify_logits_adjustments_are_noop(sampling_info)
+            ):
+                raise ValueError(
+                    "Precomputed VP top-1 requires unmodified greedy sampling."
+                )
+            return logits_output.target_top1_token_ids[
+                : logits_output.next_token_logits.shape[0]
+            ].clone()
         logits = logits_output.next_token_logits
         maybe_detect_nan(logits, "sampler: next_token_logits")
         _trace_e2e_sampler(

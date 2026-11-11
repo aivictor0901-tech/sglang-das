@@ -1557,6 +1557,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
+        from sglang.srt.speculative.dspark_vp_greedy import validate_request
+
+        validate_request(sampling_params, obj)
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
@@ -3215,8 +3218,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if recv_obj.time_stats is not None:
                     output_emit_time = getattr(
                         recv_obj.time_stats[i], "output_emit_time", 0.0
-                        )
-                    if output_emit_time > 0.0 and state.time_stats.first_token_time > 0.0:
+                    )
+                    if (
+                        output_emit_time > 0.0
+                        and state.time_stats.first_token_time > 0.0
+                    ):
                         self.metrics_collector.observe_outbound_latency(
                             labels,
                             state.time_stats.first_token_time - output_emit_time,

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from sglang.srt.runtime_context import get_parallel
 import logging
 import os
 from typing import List, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
+
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -346,8 +347,12 @@ class DSparkLMHeadVocabParallel:
             raise ValueError("DSPARK VP requires a full, unpadded 2-D LM-head weight.")
         # Channelwise FP8 keeps E4M3 rows plus one FP32 scale per vocabulary
         # row, so each shard is a row slice of both and reuses the same GEMM.
-        self.is_channelwise_int8 = full_weight.dtype == torch.int8 and weight_scale is not None
-        self.is_channelwise_fp8 = weight_scale is not None and not self.is_channelwise_int8
+        self.is_channelwise_int8 = (
+            full_weight.dtype == torch.int8 and weight_scale is not None
+        )
+        self.is_channelwise_fp8 = (
+            weight_scale is not None and not self.is_channelwise_int8
+        )
         if self.is_channelwise_int8:
             from sglang.kernels.ops.gemm.dsv41_int8 import require_int8_vp_backend
 
@@ -355,9 +360,12 @@ class DSparkLMHeadVocabParallel:
             if (
                 weight_scale.dtype != torch.float32
                 or tuple(weight_scale.shape) != (vocab_size, 1)
-                or activation_dtype not in (torch.bfloat16, torch.float16, torch.float32)
+                or activation_dtype
+                not in (torch.bfloat16, torch.float16, torch.float32)
             ):
-                raise ValueError("INT8 VP requires FP32 [vocab,1] scales and floating activations.")
+                raise ValueError(
+                    "INT8 VP requires FP32 [vocab,1] scales and floating activations."
+                )
         elif self.is_channelwise_fp8:
             if (
                 full_weight.dtype != torch.float8_e4m3fn
@@ -445,16 +453,24 @@ class DSparkLMHeadVocabParallel:
             self.weight_shard_t = None
             if workspace is None:
                 self.int8_projection = Int8VPProjection(
-                    full_weight, weight_scale, vp_rank=self.vp_rank,
-                    vp_size=vp_size, input_dtype=self.dtype,
+                    full_weight,
+                    weight_scale,
+                    vp_rank=self.vp_rank,
+                    vp_size=vp_size,
+                    input_dtype=self.dtype,
                 )
             else:
                 if not workspace.is_channelwise_int8:
-                    raise ValueError("Shared VP workspace has an incompatible INT8 layout.")
+                    raise ValueError(
+                        "Shared VP workspace has an incompatible INT8 layout."
+                    )
                 self.int8_projection = workspace.int8_projection
                 self.int8_projection.validate_shared(
-                    full_weight, weight_scale, vp_rank=self.vp_rank,
-                    vp_size=vp_size, input_dtype=self.dtype,
+                    full_weight,
+                    weight_scale,
+                    vp_rank=self.vp_rank,
+                    vp_size=vp_size,
+                    input_dtype=self.dtype,
                 )
         elif self.is_channelwise_fp8:
             # Row-major slices, as the full-head channelwise GEMM consumes them.
@@ -522,11 +538,23 @@ class DSparkLMHeadVocabParallel:
                 "gathered_hidden",
                 "shard_logits",
                 "received_logits",
+                "greedy_local_candidates",
+                "greedy_gathered_candidates",
+                "greedy_scores",
+                "greedy_tokens",
+                "greedy_anchor_local",
+                "greedy_anchor_global",
             ):
                 setattr(self, name, getattr(workspace, name))
         # Keep outputs separate. Draft logits can outlive projection while the
         # target computes p; reusing this output would corrupt the proposal q.
         self.full_logits = torch.empty((max_rows_per_rank, vocab_size), **options)
+        self.greedy_output_scores = torch.empty(
+            max_rows_per_rank, device=self.device, dtype=torch.float32
+        )
+        self.greedy_output_tokens = torch.empty(
+            max_rows_per_rank, device=self.device, dtype=torch.int64
+        )
 
         # Initialize both collective types before CUDA Graph capture.
         if workspace is None:
@@ -593,15 +621,33 @@ class DSparkLMHeadVocabParallel:
         self.gathered_hidden = torch.empty((total_rows, self.hidden_size), **options)
         self.shard_logits = torch.empty((total_rows, self.shard_size), **options)
         self.received_logits = torch.empty_like(self.shard_logits)
+        self.greedy_local_candidates = torch.empty(
+            (total_rows, 2), device=self.device, dtype=torch.float32
+        )
+        self.greedy_gathered_candidates = torch.empty(
+            (self.vp_size * total_rows, 2), device=self.device, dtype=torch.float32
+        )
+        self.greedy_scores = torch.empty(
+            total_rows, device=self.device, dtype=torch.float32
+        )
+        self.greedy_tokens = torch.empty(
+            total_rows, device=self.device, dtype=torch.int64
+        )
+        self.greedy_anchor_local = torch.empty(
+            rows, device=self.device, dtype=torch.int64
+        )
+        self.greedy_anchor_global = torch.empty(
+            total_rows, device=self.device, dtype=torch.int64
+        )
         if self.is_channelwise_int8:
             self.int8_projection.reserve(total_rows)
         self._workspace_state["rows"] = rows
 
     @torch.no_grad()
-    def project_logits(
+    def project_sharded(
         self, hidden_states: torch.Tensor, *, padded_rows: int | None = None
-    ) -> torch.Tensor:
-        """Return local full-vocabulary logits, including for uneven/idle DP ranks.
+    ):
+        """Return the vocabulary shard for all owners, including padded idle rows.
 
         Graph callers supply their common capture bucket. Eager callers agree
         on the largest local row count. Every VP rank must call, including idle
@@ -631,14 +677,13 @@ class DSparkLMHeadVocabParallel:
                 f"capacity={self.max_rows_per_rank}."
             )
         if padded_rows == 0:
-            return self.full_logits[:0]
+            return self.shard_logits[:0], rows, padded_rows
         local = self.local_hidden[:padded_rows]
         local[:rows].copy_(hidden_states)
         local[rows:].zero_()
         total = padded_rows * self.vp_size
         gathered = self.gathered_hidden[:total]
         partial = self.shard_logits[:total]
-        received = self.received_logits[:total]
         self._all_gather(gathered, local)
         if self.is_channelwise_int8:
             self.int8_projection.project(gathered, partial)
@@ -654,10 +699,58 @@ class DSparkLMHeadVocabParallel:
             )
         else:
             torch.mm(gathered, self.weight_shard_t, out=partial)
+        return partial, rows, padded_rows
+
+    @torch.no_grad()
+    def project_logits(self, hidden_states, *, padded_rows=None):
+        partial, rows, padded = self.project_sharded(
+            hidden_states, padded_rows=padded_rows
+        )
+        if not padded:
+            return self.full_logits[:0]
+        received = self.received_logits[: padded * self.vp_size]
         self._all_to_all(received, partial)
-        self.full_logits[:padded_rows].view(
-            padded_rows, self.vp_size, self.shard_size
-        ).copy_(
-            received.view(self.vp_size, padded_rows, self.shard_size).permute(1, 0, 2)
+        self.full_logits[:padded].view(padded, self.vp_size, self.shard_size).copy_(
+            received.view(self.vp_size, padded, self.shard_size).permute(1, 0, 2)
         )
         return self.full_logits[:rows]
+
+    @torch.no_grad()
+    def top1_from_shard(
+        self, partial, *, bias=None, all_rows=True, local_rows=None, padded_rows=None
+    ):
+        from sglang.srt.speculative.dspark_vp_greedy import (
+            local_candidates,
+            merge_candidates,
+        )
+
+        total = partial.shape[0]
+        local = self.greedy_local_candidates[:total]
+        gathered = self.greedy_gathered_candidates[: self.vp_size * total]
+        scores, tokens = self.greedy_scores[:total], self.greedy_tokens[:total]
+        local_candidates(
+            partial, bias, vocab_start=self.vp_rank * self.shard_size, out=local
+        )
+        self._all_gather(gathered, local)
+        merge_candidates(
+            gathered, scores, tokens, vp_size=self.vp_size, shard_size=self.shard_size
+        )
+        if all_rows:
+            return scores, tokens
+        start = self.vp_rank * padded_rows
+        self.greedy_output_scores[:local_rows].copy_(scores[start : start + local_rows])
+        self.greedy_output_tokens[:local_rows].copy_(tokens[start : start + local_rows])
+        return self.greedy_output_scores[:local_rows], self.greedy_output_tokens[
+            :local_rows
+        ]
+
+    @torch.no_grad()
+    def project_top1(self, hidden_states, *, padded_rows=None):
+        partial, rows, padded = self.project_sharded(
+            hidden_states, padded_rows=padded_rows
+        )
+        if not padded:
+            return self.greedy_output_scores[:0], self.greedy_output_tokens[:0]
+        return self.top1_from_shard(
+            partial, all_rows=False, local_rows=rows, padded_rows=padded
+        )

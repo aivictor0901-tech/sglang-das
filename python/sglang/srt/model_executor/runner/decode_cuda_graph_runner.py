@@ -108,9 +108,9 @@ from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_strea
 from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
-    is_hcu,
     empty_context,
     get_available_gpu_memory,
+    is_hcu,
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
@@ -254,8 +254,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.require_mlp_tp_gather = (
             require_mlp_tp_gather()
             or (
-                model_runner.model_config.use_engram
-                and get_parallel().attn_dp_size > 1
+                model_runner.model_config.use_engram and get_parallel().attn_dp_size > 1
             )
         ) and not self._forward_is_dp_local(model_runner)
         self.require_attn_tp_gather = require_attn_tp_gather()
@@ -1060,9 +1059,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
 
         if (
-            _is_hcu and self.capture_forward_mode.is_target_verify()
+            _is_hcu
+            and self.capture_forward_mode.is_target_verify()
             and not self.model_runner.is_draft_worker
-            and getattr(self.model_runner.model_config, "hc_hidden_size", None) is not None
+            and getattr(self.model_runner.model_config, "hc_hidden_size", None)
+            is not None
         ):
             forward_batch.return_hidden_states_before_norm = True
 
@@ -1524,7 +1525,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(fb_view)
 
         if _is_hcu and get_moe_a2a_backend().is_megamoe():
-            from sglang.srt.layers.moe.mega_moe import set_mega_moe_cuda_graph_num_tokens
+            from sglang.srt.layers.moe.mega_moe import (
+                set_mega_moe_cuda_graph_num_tokens,
+            )
+
             set_mega_moe_cuda_graph_num_tokens(raw_num_token)
 
         self.raw_bs = raw_bs
@@ -1609,6 +1613,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 output,
                 next_token_logits=next_token_logits,
                 full_logits=full_logits,
+                target_top1_token_ids=(
+                    output.target_top1_token_ids[: self.raw_num_token]
+                    if output.target_top1_token_ids is not None
+                    else None
+                ),
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None

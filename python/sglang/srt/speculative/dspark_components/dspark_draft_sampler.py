@@ -127,6 +127,29 @@ class DsparkDraftSampler:
                 bs=bs,
                 gamma=self.gamma,
             )
+        from sglang.srt.speculative.dspark_vp_greedy import draft_block, enabled
+
+        if enabled() and getattr(self.model, "draft_lm_head_vp", None) is not None:
+            assert not self.folded_sampling
+            anchor = input_ids.view(bs, self.query_token_num)[:, 0]
+            tokens = draft_block(
+                self.model,
+                model_hidden,
+                anchor,
+                gamma=self.gamma,
+                padded_rows=model_hidden.shape[0],
+            )
+            self.out[: tokens.numel()].copy_(tokens.reshape(-1))
+            if self.confidence_out is not None:
+                features = self.model.collapse_hc_head(model_hidden)
+                confidence = self.confidence_fn(
+                    draft_hidden=sample_hidden,
+                    anchor_tokens=anchor,
+                    draft_tokens=tokens,
+                    confidence_tap=features,
+                )
+                self.confidence_out[:bs].copy_(confidence)
+            return
         if getattr(self.model, "draft_lm_head_vp", None) is not None:
             # MoE draft graph buckets are agreed across the TP group, including
             # idle DP ranks. Avoid a host row-count synchronization in capture.
@@ -206,6 +229,10 @@ def _resolve_folded_sampling(
     """The sampling buffers are baked into the captured draft graph, so AUTO
     must decide before capture from a free-memory probe. ``available_memory_gb``
     is the group minimum, so every rank folds identically."""
+    from sglang.srt.speculative.dspark_vp_greedy import enabled
+
+    if enabled():
+        return False
     mode = envs.SGLANG_DSPARK_FOLDED_SAMPLING.get()
     if mode == DsparkFoldedSampling.OFF:
         return False

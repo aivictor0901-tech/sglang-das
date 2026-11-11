@@ -143,6 +143,7 @@ def _configure_target_hidden_projection(
         )
     )
 
+
 def _is_context_only_pp_prefill_rank(
     *, disaggregation_mode: str, pp_rank: int, pp_size: int
 ) -> bool:
@@ -370,6 +371,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             block_pos_offsets=self._block_pos_offsets,
         )
+        from sglang.srt.speculative.dspark_vp_greedy import enabled
+
+        if enabled() and (
+            self._verify_planner.mode_value != "static"
+            or not get_parallel().attn_dp_enabled
+            or get_parallel().attn_tp_size != 1
+            or get_parallel().pp_size != 1
+        ):
+            raise ValueError(
+                "Greedy VP top-1 currently requires static DSPARK and DP-local attention (EP8/DP8)."
+            )
         self._proposer = DraftBlockProposer(
             draft_model=self.draft_model,
             draft_model_runner=self.draft_model_runner,
@@ -597,9 +609,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _draft_context(self):
         with ExitStack() as stack:
             if self._draft_dp_context_enabled:
-                stack.enter_context(
-                    draft_tp_context(True)
-                )
+                stack.enter_context(draft_tp_context(True))
             stack.enter_context(speculative_moe_backend_context())
             stack.enter_context(speculative_moe_a2a_backend_context())
             yield
@@ -613,11 +623,19 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not self._hosts_draft or self._is_lifecycle_only_pp_prefill_rank:
             return
         vp_size = get_spec().speculative_draft_lm_head_vp_size
-        target_vp_size = int(os.environ.get("SGLANG_DSPARK_TARGET_LM_HEAD_VP_SIZE", "1"))
+        target_vp_size = int(
+            os.environ.get("SGLANG_DSPARK_TARGET_LM_HEAD_VP_SIZE", "1")
+        )
         if target_vp_size not in (1, 4, 8, 16):
-            raise ValueError("SGLANG_DSPARK_TARGET_LM_HEAD_VP_SIZE must be 1, 4, 8 or 16.")
-        if (vp_size > 1 or target_vp_size > 1) and get_exec().features.enable_memory_saver:
-            raise ValueError("DSPARK LM-head VP does not support --enable-memory-saver.")
+            raise ValueError(
+                "SGLANG_DSPARK_TARGET_LM_HEAD_VP_SIZE must be 1, 4, 8 or 16."
+            )
+        if (
+            vp_size > 1 or target_vp_size > 1
+        ) and get_exec().features.enable_memory_saver:
+            raise ValueError(
+                "DSPARK LM-head VP does not support --enable-memory-saver."
+            )
         if memory_pool_config is not None and self._is_context_only_pp_prefill_rank:
             page_size = int(self.page_size)
 
@@ -643,10 +661,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         # Allocate projection buffers once, after request-pool sizing and before
         # graph capture. A standalone VP keeps the other head's full weight.
+        from sglang.srt.speculative.dspark_vp_greedy import (
+            enabled,
+            markov_has_full_vocab,
+        )
+
+        if enabled() and (vp_size != 8 or target_vp_size != 8):
+            raise ValueError("Greedy VP top-1 requires DraftVP8/TargetVP8.")
         if vp_size == 1 and target_vp_size == 1:
             return
-        if not self._draft_is_moe or not hasattr(self.draft_model, "enable_draft_lm_head_vp"):
-            raise ValueError("DSPARK LM-head VP currently requires a DeepSeek-V4 draft.")
+        if not self._draft_is_moe or not hasattr(
+            self.draft_model, "enable_draft_lm_head_vp"
+        ):
+            raise ValueError(
+                "DSPARK LM-head VP currently requires a DeepSeek-V4 draft."
+            )
         from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
         from sglang.srt.speculative.draft_lm_head_vp import (
             DSparkLMHeadVocabParallel,
@@ -659,6 +688,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         head = target_model.lm_head
         head_scale = channelwise_lm_head_scale(head)
         both_vp = vp_size > 1 and target_vp_size > 1
+        if enabled() and (
+            vp_size != 8
+            or target_vp_size != 8
+            or not markov_has_full_vocab(self.draft_model.markov_head)
+        ):
+            raise ValueError(
+                "Greedy VP top-1 requires DraftVP8/TargetVP8 and a replicated Markov head."
+            )
+        if enabled() and parallel.tp_rank == 0:
+            logger.info(
+                "DSPARK_VP_GREEDY_TOP1 enabled: local argmax -> candidate all-gather -> global argmax"
+            )
         if target_vp_size > 1:
             if (
                 self._is_pd_prefill
@@ -686,7 +727,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         if both_vp:
             if self.draft_model.lm_head.weight is not head.weight:
-                raise ValueError("Compact target+draft VP requires a shared LM-head weight.")
+                raise ValueError(
+                    "Compact target+draft VP requires a shared LM-head weight."
+                )
             storage = head.weight.untyped_storage().data_ptr()
             for embed in (
                 getattr(target_model.model, "embed_tokens", None),
@@ -698,7 +741,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                     and weight.device == head.weight.device
                     and weight.untyped_storage().data_ptr() == storage
                 ):
-                    raise ValueError("Full-head release cannot discard tied input embeddings.")
+                    raise ValueError(
+                        "Full-head release cannot discard tied input embeddings."
+                    )
         if vp_size > 1 and getattr(self.draft_model, "draft_lm_head_vp", None) is None:
             max_bs = max(
                 self.draft_model_runner.req_to_token_pool.size,
@@ -735,7 +780,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # Both paths now use the same GPU shard. Release the complete
                 # weight without a CPU backup; keep only interface metadata.
                 metadata_weight = torch.nn.Parameter(
-                    torch.empty(head.weight.shape, dtype=head.weight.dtype, device="meta"),
+                    torch.empty(
+                        head.weight.shape, dtype=head.weight.dtype, device="meta"
+                    ),
                     requires_grad=head.weight.requires_grad,
                 )
                 head.weight = metadata_weight
@@ -743,7 +790,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if draft_vp.device.type == "cuda":
                     with torch.cuda.device(draft_vp.device):
                         torch.cuda.empty_cache()
-        DSparkLMHeadVocabParallel.guard_online_weight_updates(target_model, self.draft_model)
+        DSparkLMHeadVocabParallel.guard_online_weight_updates(
+            target_model, self.draft_model
+        )
 
     def init_attention_backends(self):
         if not self._hosts_draft or self._is_context_only_pp_prefill_rank:
@@ -768,6 +817,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
+        from sglang.srt.speculative.dspark_vp_greedy import enabled
+
         if (
             not self._hosts_draft
             or self._is_context_only_pp_prefill_rank
@@ -801,7 +852,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # block eagerly from the graph's hidden states instead. Apart
                 # from being the intended precision fallback, skipping the
                 # unused hook avoids paying for two proposal computations.
-                if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
+                if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get() or enabled():
                     self._draft_sampler = self._maybe_build_draft_sampler(
                         available_memory_gb=available_mem
                     )
@@ -1094,7 +1145,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 final_pos = final_pos[token_indices]
 
         hcu_pp_context = (
-            _is_hcu and self._is_pd_prefill and self._draft_is_moe and self.ps.pp_size > 1
+            _is_hcu
+            and self._is_pd_prefill
+            and self._draft_is_moe
+            and self.ps.pp_size > 1
         )
         if not hcu_pp_context:
             if not has_local_target_hidden:
@@ -1488,6 +1542,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bs=bs,
             verify_ids_2d=verify_ids_2d,
             target_logits=logits_output.next_token_logits,
+            target_token_ids=logits_output.target_top1_token_ids,
             draft_block=draft_block,
             sampling_info=sampling_info,
             draft_input=draft_input,
