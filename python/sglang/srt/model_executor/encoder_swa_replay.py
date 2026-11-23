@@ -40,8 +40,10 @@ def fold_encoder_swa_replay(worker, batch) -> Optional[FoldedExtend]:
 
 def _hcu_fold_supported(runner, batch, parallel) -> bool:
     """A bounded eager CP8 domain whose decoder tail contains only new rows."""
+    from sglang.srt.environ import envs
     from sglang.srt.layers.cp.padding import get_cp_padding_align_size
     from sglang.srt.layers.cp.utils import enable_cp_v2
+    from sglang.srt.layers.moe import get_moe_a2a_backend
     from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers import (
         is_cp_cache_layer_split_deepseek_v4_pool,
     )
@@ -90,8 +92,14 @@ def _hcu_fold_supported(runner, batch, parallel) -> bool:
     replay = replay_len(prefix)
     execution_rows = ceil_align(extend + replay, parallel.attn_tp_size)
     execution_rows = ceil_align(execution_rows, get_cp_padding_align_size())
-    chunk_size = get_schedule().chunked_prefill_size or 0
-    if execution_rows > min(chunk_size, max_prefill_buffer_tokens()):
+    execution_limit = min(
+        get_schedule().chunked_prefill_size or 0, max_prefill_buffer_tokens()
+    )
+    if get_moe_a2a_backend().is_megamoe():
+        # MegaMoE receives the interleaved CP shard, including padding rows.
+        per_rank_limit = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+        execution_limit = min(execution_limit, per_rank_limit * parallel.attn_cp_size)
+    if execution_rows > execution_limit:
         return False
     if not _hcu_fold_images_are_before_replay(batch, prefix - replay):
         return False
