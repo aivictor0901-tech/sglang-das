@@ -210,16 +210,16 @@ from sglang.srt.models.deepseek_v4_replay_tail import (
     bcg_tail_kv_store,
     in_replay_tail_graph,
 )
-from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
+from sglang.srt.models.deepseek_v41_vit import Aligner, ViT, split_vit_pack_groups
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
     GPU_PLAN_KEY,
-    image_token_types,
     materialize_image_gpu,
     num_image_tokens,
     patchify_for_vit,
     resolve_patchify_backend,
 )
+from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
@@ -1038,6 +1038,10 @@ class MqaAttentionBase(nn.Module):
     # Class-level default for subclasses that read it without running __init__.
     wo_a_fp8: bool = False
     wo_a_int8: bool = False
+    fuse_int8_small_ops: bool = False
+    fuse_wo_b_int8: bool = False
+    fuse_fp8_small_ops: bool = False
+    fuse_wo_b_fp8: bool = False
 
     def __init__(
         self,
@@ -1215,6 +1219,9 @@ class MqaAttentionBase(nn.Module):
             prefix=add_prefix("wo_b", prefix),
             parallel_group="attn_tp",
         )
+
+        if _is_hcu:
+            _hip.init_wo_small_op_fusion(self)
 
         from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 
@@ -2981,6 +2988,25 @@ class MQALayer(MqaAttentionBase):
                 self.use_fused_wo_a and 0 < o.shape[0] <= _FUSED_WO_A_MAX_TOKENS
             )
 
+            input_quant_args = None
+            fp8_input_quant_args = None
+            if self.fuse_fp8_small_ops and inv_rope is None and not fuse_rope_wo_a:
+                fp8_input_quant_args = channelwise_fp8.rope_grouped_input(
+                    o,
+                    self.freqs_cis,
+                    positions,
+                    self.n_local_groups,
+                    self.qk_rope_head_dim,
+                )
+            if self.fuse_int8_small_ops and inv_rope is None and not fuse_rope_wo_a:
+                input_quant_args = channelwise_int8.rope_grouped_input(
+                    o,
+                    self.freqs_cis,
+                    positions,
+                    self.n_local_groups,
+                    self.o_lora_rank,
+                    self.qk_rope_head_dim,
+                )
             if _is_npu:
                 cos4, sin4 = self._get_npu_rope_position_cache(
                     forward_batch, positions, o.dtype, inverse=True
@@ -2992,7 +3018,12 @@ class MQALayer(MqaAttentionBase):
                     sin4,
                     qk_nope_dim=self.qk_nope_head_dim,
                 )
-            elif inv_rope is None and not fuse_rope_wo_a:
+            elif (
+                inv_rope is None
+                and not fuse_rope_wo_a
+                and input_quant_args is None
+                and fp8_input_quant_args is None
+            ):
                 # The fused path folds this in; it must not run twice.
                 fused_rope_inplace(
                     o[..., -self.qk_rope_head_dim :],
@@ -3006,7 +3037,16 @@ class MQALayer(MqaAttentionBase):
 
             if self.wo_a_int8:
                 o = channelwise_int8.grouped(
-                    o, self.wo_a, self.n_local_groups, self.o_lora_rank
+                    o,
+                    self.wo_a,
+                    self.n_local_groups,
+                    self.o_lora_rank,
+                    input_quant_args=input_quant_args,
+                    quantize_output=(
+                        self.fuse_wo_b_int8
+                        and o.dtype == torch.bfloat16
+                        and not get_forward().sp_active
+                    ),
                 )
             elif fuse_rope_wo_a:
                 wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
@@ -3020,7 +3060,14 @@ class MQALayer(MqaAttentionBase):
                 o = Mxfp8SwizzledInput(*out) if fuse_mxfp8_quant else out[0]
             elif self.wo_a_channelwise_fp8:
                 o = channelwise_fp8.grouped(
-                    o, self.wo_a, self.n_local_groups, self.o_lora_rank
+                    o,
+                    self.wo_a,
+                    self.n_local_groups,
+                    self.o_lora_rank,
+                    quantized=fp8_input_quant_args,
+                    quantize_output=(
+                        self.fuse_wo_b_fp8 and not get_forward().sp_active
+                    ),
                 )
             elif self.use_npu_arch35_mxfp8_wo_a:
                 o, o_scale = torch_npu.npu_dynamic_mx_quant(
@@ -4304,6 +4351,39 @@ class DeepseekV4Model(nn.Module):
                         if self.late_layer_vl_routing
                         else None
                     )
+            if (
+                _is_hcu
+                and tail is not None
+                and i == self.late_layer_start
+                and tail.cp_metadata is not None
+                and not is_in_breakable_cuda_graph()
+                and not envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.get()
+                and not get_global_expert_distribution_recorder().recording
+                and envs.SGLANG_HCU_DSV41_TAIL_MOE_CUDA_GRAPH.get()
+                and envs.SGLANG_HCU_DSV41_TAIL_MOE_LOW_LATENCY.get()
+                and get_moe_a2a_backend().is_deepep()
+            ):
+                from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+                    HcuDSV41TailGraphRunner,
+                )
+
+                runner = getattr(self, "_hcu_tail_graph_runner", None)
+                if runner is None:
+                    runner = self._hcu_tail_graph_runner = HcuDSV41TailGraphRunner(self)
+                result = runner.run(
+                    state,
+                    positions,
+                    input_ids,
+                    input_ids_global,
+                    forward_batch,
+                    tail,
+                    capture_dspark,
+                    dspark_layers_to_capture,
+                )
+                if result is not None:
+                    state, aux = result
+                    dspark_aux_hidden_states.extend(aux)
+                    break
             engram = self.layers[i].engram
             if engram is not None:
                 before_engram = state.residual
@@ -4929,6 +5009,28 @@ def _should_disable_v41_vision_for_hcu(config: DeepSeekV4Config) -> bool:
     )
 
 
+@functools.lru_cache(maxsize=128)
+def _get_image_span_indices(
+    n_llm_h: int,
+    n_llm_w: int,
+    device_type: str,
+    device_index: Optional[int],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    device = (
+        torch.device(device_type)
+        if device_index is None
+        else torch.device(device_type, device_index)
+    )
+    row_starts = 1 + torch.arange(n_llm_h, device=device, dtype=torch.long) * (
+        n_llm_w + 1
+    )
+    image_indices = (
+        row_starts[:, None]
+        + torch.arange(n_llm_w, device=device, dtype=torch.long)[None, :]
+    ).reshape(-1)
+    newline_indices = row_starts + n_llm_w
+    return image_indices, newline_indices
+
 
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
@@ -5254,26 +5356,85 @@ class DeepseekV4ForCausalLM(nn.Module):
                 "deploy an encoder node and retry."
             )
 
+        patches, h, w, borrowed_proxy = self._load_image_patches(
+            item, allow_ipc_borrow=True
+        )
+        try:
+            features = self.aligner(self.vision(patches, h, w), h, w)
+            return self._assemble_image_span(features, h=h, w=w)
+        finally:
+            if borrowed_proxy is not None:
+                borrowed_proxy.release_borrowed_on_current_stream()
+
+    def _load_image_patches(
+        self, item, *, allow_ipc_borrow: bool = False
+    ) -> Tuple[torch.Tensor, int, int, Optional[CudaIpcTensorTransportProxy]]:
         device, dtype = self.image_start.device, self.image_start.dtype
-        item.reconstruct(device.index, ipc_consumer_count=self.tp_size)
+        borrowed_proxy = None
+        device_index = device.index
+        pixels = None
+        if (
+            allow_ipc_borrow
+            and self.tp_size == 1
+            and isinstance(item.feature, CudaIpcTensorTransportProxy)
+        ):
+            pixels = item.feature.borrow_on_target_device(device_index)
+            if pixels is not None:
+                borrowed_proxy = item.feature
+        if borrowed_proxy is None:
+            item.reconstruct(device_index, ipc_consumer_count=self.tp_size)
+            pixels = item.feature
+
         h, w = int(item.n_vit_h), int(item.n_vit_w)
-        pixels = torch.as_tensor(item.feature, device=device)
-        plan = item.model_specific_data.get(GPU_PLAN_KEY)
-        patches = (
-            materialize_image_gpu(pixels, plan).to(dtype)
-            if plan is not None
-            else pixels.to(dtype)
-        )
-        features = self.aligner(self.vision(patches, h, w), h, w)
+        try:
+            pixels = torch.as_tensor(pixels, device=device)
+            plan = item.model_specific_data.get(GPU_PLAN_KEY)
+            patches = (
+                materialize_image_gpu(pixels, plan).to(dtype)
+                if plan is not None
+                else pixels.to(dtype)
+            )
+        except Exception:
+            if borrowed_proxy is not None:
+                borrowed_proxy.release_borrowed_on_current_stream()
+            raise
+        return patches, h, w, borrowed_proxy
+
+    def _assemble_image_span(
+        self, features: torch.Tensor, h: int, w: int, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        device, dtype = self.image_start.device, self.image_start.dtype
         r = self.config.vision_downsample_ratio
-        types = image_token_types((h + r - 1) // r, (w + r - 1) // r).to(device)
-        span = torch.empty(
-            (len(types), self.config.hidden_size), device=device, dtype=dtype
+        n_llm_h = (h + r - 1) // r
+        n_llm_w = (w + r - 1) // r
+        span = (
+            torch.empty(
+                (n_llm_h * (n_llm_w + 1) + 2, self.config.hidden_size),
+                device=device,
+                dtype=dtype,
+            )
+            if out is None
+            else out
         )
-        span[types == 0] = self.image_start
-        span[types == 1] = features.to(dtype)
-        span[types == 2] = self.image_newline
-        span[types == 3] = self.image_end
+        image_indices, newline_indices = _get_image_span_indices(
+            n_llm_h,
+            n_llm_w,
+            device.type,
+            device.index,
+        )
+        assert span.shape[0] == n_llm_h * (n_llm_w + 1) + 2, (
+            span.shape,
+            n_llm_h,
+            n_llm_w,
+        )
+        span[0].copy_(self.image_start)
+        span[-1].copy_(self.image_end)
+        span.index_copy_(0, image_indices, features.to(dtype))
+        span.index_copy_(
+            0,
+            newline_indices,
+            self.image_newline.expand(newline_indices.numel(), -1),
+        )
         return span
 
     def get_image_feature_for_encoder(self, items):
@@ -5283,7 +5444,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         the multimodal embedding cache can own each image independently.
 
         Encoder-side contract: items are always materialized from the local
-        vision tower and never carry precomputed_embeddings.
+        vision tower and never carry precomputed_embeddings. Images are packed
+        into varlen ViT forwards, bounded by ``MAX_PACKED_VIT_PATCHES``.
         """
         items = list(items)
         if not items:
@@ -5300,20 +5462,42 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
 
         device, dtype = self.image_start.device, self.image_start.dtype
-        total_tokens = 0
-        for item in items:
-            item.reconstruct(device.index)
-            h, w = int(item.n_vit_h), int(item.n_vit_w)
-            r = self.config.vision_downsample_ratio
-            total_tokens += num_image_tokens((h + r - 1) // r, (w + r - 1) // r)
+        r = self.config.vision_downsample_ratio
+        grids = [(int(item.n_vit_h), int(item.n_vit_w)) for item in items]
+        span_lens = [
+            num_image_tokens((h + r - 1) // r, (w + r - 1) // r) for h, w in grids
+        ]
+        total_tokens = sum(span_lens)
 
         output = torch.empty((total_tokens, self.config.hidden_size), device=device, dtype=dtype)
         offset = 0
-        for item in items:
-            span = self._get_image_feature_span(item)
-            end = offset + span.shape[0]
-            output[offset:end].copy_(span)
-            offset = end
+        for group in split_vit_pack_groups(grids):
+            group_grids = [grids[index] for index in group]
+            patches = []
+            borrowed_proxies = []
+            try:
+                for index in group:
+                    image_patches, _, _, borrowed_proxy = self._load_image_patches(
+                        items[index], allow_ipc_borrow=True
+                    )
+                    patches.append(image_patches)
+                    if borrowed_proxy is not None:
+                        borrowed_proxies.append(borrowed_proxy)
+                vit_out = self.vision.forward_packed(
+                    patches[0] if len(patches) == 1 else torch.cat(patches),
+                    grids=group_grids,
+                )
+                features = self.aligner.forward_packed(vit_out, grids=group_grids)
+                for index, image_features in zip(group, features):
+                    h, w = grids[index]
+                    end = offset + span_lens[index]
+                    self._assemble_image_span(
+                        image_features, h=h, w=w, out=output[offset:end]
+                    )
+                    offset = end
+            finally:
+                for borrowed_proxy in borrowed_proxies:
+                    borrowed_proxy.release_borrowed_on_current_stream()
         # The upfront size must match the spans, or the tail stays uninitialized.
         assert offset == total_tokens, (offset, total_tokens)
         return output
@@ -5705,11 +5889,19 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
+        # Startup-only work; runs before serving traffic reaches the vision
+        # tower, so capture cannot race the GPU image preprocessing threads.
+        if self.vision is not None and not is_nextn:
+            self.vision.warmup_cuda_graphs()
         if self.encoder_only:
             # Vision-only encoder node: no decoder layers to hot-fix.
             return
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
+        if _is_hcu:
+            from sglang.kernels.ops.gemm.bf16_fp32 import prepare_hcu_nn_weights_for_model
+
+            prepare_hcu_nn_weights_for_model(self)
 
         for module in self.modules():
             if isinstance(module, MQALayer):
@@ -5735,6 +5927,16 @@ class DeepseekV4ForCausalLM(nn.Module):
         for i, layer in enumerate(layers):
             if isinstance(layer, DeepseekV4PlatformDecoderLayer):
                 layer.bind_next(layers[i + 1] if i + 1 < len(layers) else None)
+
+    def post_ipc_weight_load(self) -> None:
+        """Per-process fix-up after the weight cache mapped this model.
+
+        ``load_weights`` never ran here. Its weight rewrites were done once by
+        the daemon on the shared memory, and the flags that guard them (e.g.
+        ``ape_converted``) were carried over, so ``post_load_weights`` only
+        rebuilds what is local to this process: layer links and derived caches.
+        """
+        self.post_load_weights()
 
     def precompile_kernels_after_loading(self) -> None:
         from sglang.srt.layers.moe.mega_moe import (

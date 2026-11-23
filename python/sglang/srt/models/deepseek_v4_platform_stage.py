@@ -5,14 +5,20 @@ The mixins own platform mHC state, fusion, and TBO operations.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from functools import cached_property
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     can_fuse_all_reduce,
+)
+from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
 )
 from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
@@ -38,14 +44,51 @@ from sglang.srt.models.deepseek_common.moe_transport import (
 )
 from sglang.srt.models.deepseek_v2 import MoEOutput
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE, AttnOutput
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.utils import is_gfx95_supported, is_hcu
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models import deepseek_v2
 
 _is_gfx95_supported = is_gfx95_supported()
+_is_hcu = is_hcu()
+
+
+def _hcu_tail_moe_context(cp_active):
+    if not (
+        _is_hcu
+        and cp_active
+        and envs.SGLANG_HCU_DSV41_TAIL_MOE_LOW_LATENCY.get()
+        and get_moe_a2a_backend().is_deepep()
+    ):
+        return nullcontext()
+    tail = get_attn_backend().forward_metadata.late_layer_tail
+    if tail is None or tail.cp_metadata is None:
+        return nullcontext()
+    # Every CP rank must choose the same dispatch mode.
+    return get_forward().scoped(
+        deepep_tail_max_tokens=max(tail.cp_metadata.per_rank_actual_token)
+    )
+
+
+def _hcu_tail_graph_attention_stub(runner, layer, x, positions, x_quant, defer_all_reduce):
+    # Capture has not run the preceding graph segment yet.
+    assert not defer_all_reduce
+    return torch.empty_like(x)
+
+
+@eager_on_graph(capture_stub=_hcu_tail_graph_attention_stub)
+def _hcu_tail_graph_attention(runner, layer, x, positions, x_quant, defer_all_reduce):
+    batch = runner.forward_batch
+    with layer.maybe_use_decode_attn_tp(batch):
+        return layer(
+            x=x,
+            positions=positions,
+            forward_batch=batch,
+            x_quant=x_quant,
+            defer_all_reduce=defer_all_reduce,
+        )
 
 
 def _prepare_ffn_input(layer, hidden_states, residual, post, comb, forward_batch):
@@ -143,6 +186,7 @@ class NonCudaDecoderMixin:
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):
             stats_stream = self.hc_stats_stream
+        tail_graph_runner = get_forward().dsv41_tail_graph_runner
 
         def run_attn_hc(state: mhc.HcState) -> mhc.HcState:
             assert self.attn_hc is not None
@@ -157,14 +201,25 @@ class NonCudaDecoderMixin:
             fuse_all_reduce_mhc = self._can_fuse_attn_mhc and can_fuse_all_reduce(
                 x.shape[0], self.hc_cfg.hidden
             )
-            with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
-                y = self.self_attn(
-                    x=x,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    x_quant=quantized[0] if quantized else None,
-                    defer_all_reduce=fuse_all_reduce_mhc,
+            x_quant = quantized[0] if quantized else None
+            if tail_graph_runner is not None:
+                y = _hcu_tail_graph_attention(
+                    tail_graph_runner,
+                    self.self_attn,
+                    x,
+                    positions,
+                    x_quant,
+                    fuse_all_reduce_mhc,
                 )
+            else:
+                with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+                    y = self.self_attn(
+                        x=x,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        x_quant=x_quant,
+                        defer_all_reduce=fuse_all_reduce_mhc,
+                    )
             del x
             return mhc.run_attn_post(
                 self.attn_hc,
@@ -202,7 +257,7 @@ class NonCudaDecoderMixin:
                 y,
                 residual,
                 stats_stream=stats_stream,
-                next=self.next_boundary,
+                next=None if tail_graph_runner is not None else self.next_boundary,
                 world_size=self.mlp.tp_size,
                 precomputed=precomputed,
             )
@@ -342,7 +397,7 @@ class NonCudaDecoderMixin:
             input_ids_global,
             cp_return_contiguous=self.config.model_type == "deepseek_v41",
         )
-        with prepared.scope():
+        with prepared.scope(), _hcu_tail_moe_context(prepared._use_cp):
             return_moe_output = (
                 return_moe_output
                 and not prepared._use_cp

@@ -230,6 +230,31 @@ def _get_hcu_w8a8_pre_dispatch_quant():
     return _MEGA_MOE_HCU_W8A8_PRE_DISPATCH_QUANT
 
 
+def _try_stage_standalone_megamoe_inputs(hidden_states, topk_ids, topk_weights, buf):
+    # Eager validation and dispatch cost more than the saved copies on small inputs.
+    # Use workload size so this policy is independent of the device and quant dtype.
+    if (
+        not envs.SGLANG_OPT_DSV41_SMALL_OP_FUSION.get()
+        or hidden_states.ndim != 2
+        or hidden_states.shape[0] < 1024
+        or hidden_states.numel() < 4 * 1024 * 1024
+    ):
+        return False
+    from sglang.kernels.ops.moe.per_token_quant_stage import (
+        try_quantize_and_stage_moe_inputs,
+    )
+
+    return try_quantize_and_stage_moe_inputs(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        buf.x,
+        buf.x_sf,
+        buf.topk_idx,
+        buf.topk_weights,
+    )
+
+
 def _prepare_standalone_megamoe_inputs(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -238,6 +263,10 @@ def _prepare_standalone_megamoe_inputs(
     num_tokens: int,
 ) -> None:
     quant = _get_hcu_w8a8_pre_dispatch_quant()
+    if quant is not None and _try_stage_standalone_megamoe_inputs(
+        hidden_states, topk_ids, topk_weights, buf
+    ):
+        return
     if quant is not None:
         quant_input = (
             hidden_states
@@ -781,7 +810,12 @@ def run_mega_routed_experts(
     if _is_hcu:
         is_w4a8 = getattr(experts, "_mega_moe_hcu_w4a8_weights", False)
         if is_w4a8:
-            y = _run_standalone_hcu_w4a8_mega_moe(
+            run_w4a8 = (
+                _run_standalone_hcu_w4a8_mega_moe
+                if runtime == _HCU_MEGA_MOE_RUNTIME_MEGAMOE
+                else _run_deep_gemm_hcu_w4a8_mega_moe
+            )
+            y = run_w4a8(
                 hidden_states,
                 topk_ids,
                 topk_weights,
@@ -1034,6 +1068,37 @@ def _run_standalone_hcu_w8a8_mega_moe(
     return y[:num_tokens]
 
 
+def _run_deep_gemm_hcu_w4a8_mega_moe(
+    hidden_states, topk_ids, topk_weights, experts, buf, *, activation_clamp=None
+):
+    import deepgemm.mega
+
+    tokens, hidden = hidden_states.shape
+    if tokens:
+        deepgemm.mega.mega_moe_preprocess(
+            hidden_states.to(torch.bfloat16).contiguous(),
+            topk_ids.contiguous(),
+            topk_weights.contiguous(),
+            buf,
+            tokens,
+            mode="w4a8",
+        )
+    y = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=hidden_states.device)
+    # Empty ranks still join the fused kernel's peer-memory barriers.
+    deepgemm.mega.fp8_mega_moe(
+        y,
+        experts.mega_l1_weights,
+        experts.mega_l2_weights,
+        buf,
+        mode="w4a8",
+        activation_clamp=(
+            activation_clamp if activation_clamp is not None else float("inf")
+        ),
+        fast_math=True,
+    )
+    return y
+
+
 def _run_standalone_hcu_w4a8_mega_moe(
     hidden_states, topk_ids, topk_weights, experts, buf, *, activation_clamp=None
 ):
@@ -1041,7 +1106,9 @@ def _run_standalone_hcu_w4a8_mega_moe(
     from megamoe.w4a8 import w4a8_mega_moe
 
     tokens, hidden = hidden_states.shape
-    if tokens:
+    if tokens and not _try_stage_standalone_megamoe_inputs(
+        hidden_states, topk_ids, topk_weights, buf
+    ):
         qx, scale = per_token_quant_int8(hidden_states)
         buf.x[:tokens].copy_(qx)
         buf.x_sf[:tokens].copy_(scale.reshape(-1))
@@ -1067,16 +1134,28 @@ def build_hcu_w4a8_mega_moe_experts_weights(experts) -> None:
 
     if getattr(experts, "_mega_moe_weights_built", False):
         return
-    if not _is_hcu or get_hcu_mega_moe_runtime() != "megamoe":
-        raise ValueError(
-            "W4A8 MegaMoE requires HCU and SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe"
-        )
+    if not _is_hcu:
+        raise ValueError("W4A8 MegaMoE requires HCU")
+    runtime = get_hcu_mega_moe_runtime()
     if get_exec().moe.enable_eplb:
         raise ValueError(
             "W4A8 MegaMoE supports offline EPLB via --init-expert-location; online EPLB is unsupported"
         )
     if not cuda_graph_fully_disabled():
         raise ValueError("W4A8 MegaMoE prefill currently requires --disable-cuda-graph")
+    if runtime == _HCU_MEGA_MOE_RUNTIME_DEEP_GEMM:
+        from deepgemm.mega import tile256_gate_up
+
+        if (
+            experts.w13_weight.shape[1:] != (4608, 2560)
+            or experts.w2_weight.shape[1:] != (5120, 1152)
+            or experts.w13_weight.shape[0] > 64
+        ):
+            raise ValueError("DeepGEMM W4A8 MegaMoE requires H=5120, I=2304, local experts <=64")
+        experts.w13_weight.data = tile256_gate_up(experts.w13_weight.data)
+        experts.w13_weight_scale.data = tile256_gate_up(
+            experts.w13_weight_scale.data
+        )
     # The loader has already placed logical experts into the static physical
     # slots. Repack each slot independently without changing expert order.
     for name in ("w13_weight", "w2_weight"):
@@ -1119,7 +1198,7 @@ def build_hcu_w4a8_mega_moe_experts_weights(experts) -> None:
         if torch.equal(groups, physical_groups):
             groups = None
         experts.register_buffer("mega_w4a8_combine_groups", groups, persistent=False)
-    experts._mega_moe_hcu_runtime = "megamoe"
+    experts._mega_moe_hcu_runtime = runtime
     experts._mega_moe_hcu_w4a8_weights = True
     experts._mega_moe_weights_built = True
 
