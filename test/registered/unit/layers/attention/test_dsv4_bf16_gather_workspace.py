@@ -117,7 +117,7 @@ class TestBF16GatherModelDispatch(unittest.TestCase):
             for n in cls.body
             if isinstance(n, ast.FunctionDef) and n.name == "_forward_flash_mla_decode"
         )
-        mode = SimpleNamespace(is_idle=lambda: False)
+        mode = SimpleNamespace(is_decode=lambda: False, is_target_verify=lambda: True)
         scope = {
             "torch": torch,
             "Optional": Optional,
@@ -156,6 +156,7 @@ class TestBF16GatherModelDispatch(unittest.TestCase):
                 _dsv4_bf16_flashmla_decode=True,
                 _try_prepare_dsv4_w4a8_bf16_inputs=Mock(return_value=compact_result),
                 _prepare_dsv4_bf16_flashmla_inputs=Mock(return_value=prepared),
+                _use_dsv4_bf16_gather_dedup=Mock(return_value=True),
                 _build_flash_mla_input_dict=Mock(return_value={}),
                 _call_flash_mla_with_kvcache=Mock(
                     return_value=torch.zeros((12, 1, 512))
@@ -164,12 +165,15 @@ class TestBF16GatherModelDispatch(unittest.TestCase):
             scope[method.name](obj, **args)
             obj._try_prepare_dsv4_w4a8_bf16_inputs.assert_called_once()
             if compact_result is None:
+                obj._use_dsv4_bf16_gather_dedup.assert_called_once_with(
+                    args["forward_batch"], 12
+                )
                 obj._prepare_dsv4_bf16_flashmla_inputs.assert_called_once()
-                self.assertNotIn(
-                    "logical_forward_mode",
-                    obj._prepare_dsv4_bf16_flashmla_inputs.call_args.kwargs,
+                self.assertTrue(
+                    obj._prepare_dsv4_bf16_flashmla_inputs.call_args.kwargs["dedup"]
                 )
             else:
+                obj._use_dsv4_bf16_gather_dedup.assert_not_called()
                 obj._prepare_dsv4_bf16_flashmla_inputs.assert_not_called()
 
     def test_initialization_only_reserves_reuse_lengths_for_w4a8(self):
@@ -325,16 +329,20 @@ class TestBF16GatherModelDispatch(unittest.TestCase):
             config["config_groups"]["routed"]["input_activations"][field] = value
             self.assertEqual(model_family(config), "original")
 
-    def test_fp8_workspace_keeps_its_original_exact_topk_layout(self):
+    def test_noncompact_workspace_uses_per_call_exact_topk_layout(self):
         obj = workspace_methods()
         obj._dsv4_compact_gather_enabled = False
         with patch.object(
             torch.cuda, "is_current_stream_capturing", return_value=False
         ):
-            obj._get_dsv4_bf16_flashmla_workspace("swa", 2, 128)
+            larger, _ = obj._get_dsv4_bf16_flashmla_workspace("swa", 2, 128)
         with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
-            with self.assertRaisesRegex(RuntimeError, "before CUDA graph capture"):
-                obj._get_dsv4_bf16_flashmla_workspace("swa", 2, 64)
+            smaller, indices = obj._get_dsv4_bf16_flashmla_workspace("swa", 2, 64)
+        self.assertEqual(smaller.shape, (2, 64, 1, 512))
+        self.assertEqual(indices.shape, (2, 1, 64))
+        self.assertTrue(smaller.is_contiguous())
+        self.assertNotEqual(smaller.data_ptr(), larger.data_ptr())
+        self.assertFalse(obj._dsv4_bf16_flashmla_workspaces)
 
 
 class TestBF16GatherWorkspace(unittest.TestCase):
