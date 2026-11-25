@@ -1131,6 +1131,9 @@ class Envs:
     SGLANG_HCU_PREFILL_PAGED_SPARSE = EnvBool(True)
     # Existing packed INT8 service projections and their consumer layout.
     SGLANG_DSV41_INT8_SERVICE_OPT = EnvBool(False)
+    # Opt-in gfx936 W4A8 masked HIPC scheduling for measured DSV4.1 shapes.
+    # Requires a DeepGEMM build accepting MODE/PERSISTENT_MULTIPLIER config.
+    SGLANG_HCU_DSV41_W4A8_HIPC_TUNING = EnvBool(False)
     # DSV4.1 prefill/decode normalization, layout, staging and quantization fusions.
     SGLANG_OPT_DSV41_SMALL_OP_FUSION = EnvBool(False)
     # Eager HCU C1/C2 keeps a compact layout; opt in to TopK-union dequantization.

@@ -159,6 +159,7 @@ _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
 _use_marlin_w4a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT")
 _use_w4a8_contiguous_hipc = get_bool_env_var("SGLANG_USE_W4A8_CONTIGUOUS_HIPC")
 _use_w4a8_masked_hipc = get_bool_env_var("SGLANG_USE_W4A8_MASKED_HIPC")
+_use_dsv41_w4a8_hipc_tuning = envs.SGLANG_HCU_DSV41_W4A8_HIPC_TUNING.get()
 _use_lightop_ep_moe_align = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_MOE_ALIGN", "true")
 _use_lightop_ep_scatter = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_SCATTER", "true")
 _use_lightop_ep_gather = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_GATHER", "true")
@@ -394,9 +395,30 @@ def m_grouped_w4a8_gemm_nt_masked_hipc_wrapper(
     masked_m: torch.Tensor,
     expected_m_per_group: int,
 ) -> torch.Tensor:
-    m_grouped_w4a8_gemm_nt_masked_hipc(
-        (a0, a1), (b0, b1), d, masked_m, expected_m_per_group
-    )
+    if (
+        _use_dsv41_w4a8_hipc_tuning
+        and _is_hcu
+        and a0.ndim == d.ndim == 3
+        and a0.shape[0] == d.shape[0] == 48
+        and (expected_m_per_group == 4 or 7 <= expected_m_per_group <= 13)
+        and (d.shape[2], a0.shape[2]) in ((4608, 5120), (5120, 2304))
+        and is_hcu_gfx936()
+    ):
+        # Only override the measured Verify W13/W2 schedules. The library,
+        # packed weights, arithmetic, and all other shapes stay on their path.
+        m_grouped_w4a8_gemm_nt_masked_hipc(
+            (a0, a1),
+            (b0, b1),
+            d,
+            masked_m,
+            expected_m_per_group,
+            config={"MODE": 1322, "PERSISTENT_MULTIPLIER": 2},
+        )
+    else:
+        # Omit config entirely for older DeepGEMM builds and untuned shapes.
+        m_grouped_w4a8_gemm_nt_masked_hipc(
+            (a0, a1), (b0, b1), d, masked_m, expected_m_per_group
+        )
     # New DeepGEMM returns launch metadata; this custom op returns its output.
     return d
 
