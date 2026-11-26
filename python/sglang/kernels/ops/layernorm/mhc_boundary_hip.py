@@ -16,7 +16,8 @@ from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
     rmsnorm_row_chunk,
     row_major_2d,
 )
-from sglang.srt.utils.common import is_gfx95_supported, is_hip
+from sglang.srt.environ import envs
+from sglang.srt.utils.common import is_gfx95_supported, is_hip, is_hcu
 
 _is_hip = is_hip()
 # CDNA has no tf32: the mixing dot runs in ieee fp32 (the CUDA kernel uses tf32x3)
@@ -27,6 +28,7 @@ _HC_BOUNDARY_BLOCK_M = 16
 _HC_BOUNDARY_BLOCK_K = 64
 _HC_BOUNDARY_NUM_WARPS = 2
 _HC_BOUNDARY_NUM_STAGES = 1
+_HC_BOUNDARY_HCU_BLOCK32 = is_hcu() and envs.SGLANG_HCU_DSV41_MHC_BLOCK32.get()
 # the reduce + sinkhorn row uses the norm kernel's warp count whether hosted there or launched alone
 _HC_SINKHORN_NUM_WARPS = 4
 
@@ -925,6 +927,22 @@ def _hc_boundary_partials(
         return part_mix, part_sq
     mix_pad = max(16, triton.next_power_of_2(mix))
     block_m = _HC_BOUNDARY_BLOCK_M
+    num_warps = _HC_BOUNDARY_NUM_WARPS
+    # Keep the per-row K reduction unchanged. A pair of full 16-row tiles
+    # uses the same padded row count as one 32-row tile. Odd tile counts
+    # retain the original schedule to avoid the measured padding regression.
+    if (
+        _HC_BOUNDARY_HCU_BLOCK32
+        and 17 <= m <= 96
+        and ((m + 15) // 16) % 2 == 0
+        and h == 5120
+        and hc_mult == 4
+        and mix == 24
+        and residual.dtype == torch.bfloat16
+        and residual.device.type == "cuda"
+        and torch.cuda.get_device_properties(dev).gcnArchName.split(":")[0] == "gfx936"
+    ):
+        block_m, num_warps = 32, 4
     grid_m = triton.cdiv(m, block_m)
     _hc_boundary_partial_kernel[(grid_m, num_slices)](
         x if has_post else residual,
@@ -950,7 +968,7 @@ def _hc_boundary_partials(
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
         HAS_POST=has_post,
         HAS_COMBINE=has_combine,
-        num_warps=_HC_BOUNDARY_NUM_WARPS,
+        num_warps=num_warps,
         num_stages=_HC_BOUNDARY_NUM_STAGES,
     )
     return part_mix, part_sq

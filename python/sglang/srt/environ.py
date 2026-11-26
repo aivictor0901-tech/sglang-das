@@ -1099,6 +1099,8 @@ class Envs:
     # Opt-in: DSV4.1 decode/verify on HCU runs the Triton fused mHC boundary instead of
     # lightop stats + aiter post + combine; prefill keeps the lightop path.
     SGLANG_HCU_FUSED_MHC_BOUNDARY = EnvBool(False)
+    # Use block32 mHC scheduling for qualified gfx936 shapes without extra padding.
+    SGLANG_HCU_DSV41_MHC_BLOCK32 = EnvBool(True)
     SGLANG_USE_LIGHTOP_MOE_SUM_MUL_ADD = EnvBool(False)
     SGLANG_USE_OPT_CAT = EnvBool(False)
     SGLANG_USE_FUSED_MLA_CAT = EnvBool(False)
