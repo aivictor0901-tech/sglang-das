@@ -225,6 +225,8 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_parallel,
     get_platform,
+    get_spec,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import (
     LazyValue,
@@ -1225,9 +1227,19 @@ class MqaAttentionBase(nn.Module):
                 else 0
             )
         )
+        # Overlap may compute a final speculative block beyond the request's
+        # public context limit before its completion is retired. Match the KV
+        # allocator's two-block reservation without changing RoPE frequencies
+        # or the externally advertised context length.
+        rope_cache_len = config.max_position_embeddings
+        if get_spec().speculative_algorithm == "DSPARK":
+            speculative_width = max_speculative_num_draft_tokens()
+            if speculative_width is None or speculative_width <= 0:
+                raise ValueError("DSPARK RoPE requires a resolved positive draft width")
+            rope_cache_len += 2 * int(speculative_width)
         freqs_cis = precompute_freqs_cis(
             dim=self.qk_rope_head_dim,
-            seqlen=config.max_position_embeddings,
+            seqlen=rope_cache_len,
             original_seq_len=original_seq_len,
             base=self.rope_base,
             factor=scaling.get("factor", 1.0),
