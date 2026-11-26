@@ -1826,7 +1826,11 @@ class MQALayer(MqaAttentionBase):
                 attn_backend.forward_low_ratio_sources(
                     layer=self,
                     x=x,
-                    q_lora=q_lora,
+                    q_lora=(
+                        _hip.indexer_q_operand(self, q_lora, q_for_wqb, forward_batch)
+                        if _is_hcu
+                        else q_lora
+                    ),
                     positions=positions,
                     forward_batch=forward_batch,
                     run_compressor=False,
@@ -2068,6 +2072,7 @@ class MQALayer(MqaAttentionBase):
         k_rope_out: Optional[torch.Tensor] = None,
         overlap_layer_split_prefetch: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        q_for_wqb = None
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
@@ -2387,7 +2392,11 @@ class MQALayer(MqaAttentionBase):
                 attn_backend.forward_low_ratio_sources(
                     layer=self,
                     x=x,
-                    q_lora=q_lora,
+                    q_lora=(
+                        _hip.indexer_q_operand(self, q_lora, q_for_wqb, forward_batch)
+                        if _is_hcu and not use_cp
+                        else q_lora
+                    ),
                     positions=positions,
                     forward_batch=forward_batch,
                 )

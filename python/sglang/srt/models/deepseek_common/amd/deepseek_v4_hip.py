@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.hip_flash_mla import (
     resolve_hip_flashmla_backend,
 )
 from sglang.srt.layers.fused_rms_quant import (
+    Int8PerTokenInput,
     is_lightop_rms_fp8_quant_available,
     is_lightop_sglang_rms_quant_available,
     linear_takes_fp8_operand,
@@ -47,6 +48,7 @@ wo_b_emits_mxfp8 = gfx95_dense.wo_b_emits_mxfp8
 
 _is_gfx95_supported = is_gfx95_supported()
 _is_hcu = is_hcu()
+_indexer_q_reuse = envs.SGLANG_HCU_DSV41_REUSE_INDEXER_Q_INT8.get()
 _hcu_strided_qnorm = (
     _is_hcu and os.environ.get("SGLANG_HCU_OPT_QNORM_STRIDED", "1") == "1"
 )
@@ -180,6 +182,62 @@ def wo_a_split_k_allowed() -> bool:
 
 def use_fused_qk_norm_rope(attn) -> bool:
     return bool(envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get() and attn.q_head_norm)
+
+
+def indexer_q_operand(attn, q_lora, q_operand, forward_batch):
+    """Reuse this invocation's rounded-Q INT8 operand on compatible decode paths.
+
+    No tensor is retained on the layer: graph replays read the producer's fresh
+    buffer and eager calls cannot accidentally reuse an earlier request's data.
+    """
+    if not (_is_hcu and _indexer_q_reuse):
+        return q_lora
+    mode = forward_batch.forward_mode
+    if not (mode.is_decode() or mode.is_target_verify()):
+        return q_lora
+    if not isinstance(q_operand, Int8PerTokenInput) or q_operand.x is not q_lora:
+        return q_lora
+    indexer = getattr(attn, "indexer", None)
+    if indexer is None:
+        return q_lora
+    # Only the verified dynamic symmetric W8A8 schemes. A generic
+    # supports_prequantized_input flag also covers incompatible FP8 schemes.
+    from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8LinearMethod
+    from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import (
+        CompressedTensorsW8A8Int8,
+    )
+
+    def scheme(linear):
+        method = linear.quant_method
+        if type(method) is W8A8Int8LinearMethod:
+            return method
+        value = getattr(linear, "scheme", None)
+        if (
+            type(value) is CompressedTensorsW8A8Int8
+            and value.prequantized_input_eligible
+        ):
+            return value
+        return None
+
+    producer, consumer = scheme(attn.wq_b), scheme(indexer.wq_b)
+    if producer is None or consumer is None or type(producer) is not type(consumer):
+        return q_lora
+    if not opt_into_int8_operand(indexer.wq_b):
+        return q_lora
+    q, scale = q_operand.q, q_operand.scale
+    if not (
+        q_lora.ndim == 2
+        and q_lora.dtype == torch.bfloat16
+        and q.shape == q_lora.shape
+        and q.dtype == torch.int8
+        and scale.shape == (q_lora.shape[0], 1)
+        and scale.dtype == torch.float32
+        and q.device == scale.device == q_lora.device
+        and q.is_contiguous()
+        and scale.is_contiguous()
+    ):
+        return q_lora
+    return q_operand
 
 
 def q_norm_for_wq_b(attn, q_lora: torch.Tensor) -> Tuple[torch.Tensor, object]:
