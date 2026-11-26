@@ -79,6 +79,7 @@ class IndexerInputs:
     # [rows] int, one request id per query row, the rows of one request
     # consecutive (verify: its draft tokens); None = every row its own request
     request_ids: Optional[torch.Tensor] = None
+    native_int8: bool = False
 
     @property
     def num_rows(self) -> int:

@@ -54,6 +54,9 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.lightop_indexer import (
     lightop_paged_indexer_available,
     lightop_paired_rows_available,
+    mqa_logits_int8_chunk,
+    paged_mqa_logits_int8,
+    validate_int8_indexer,
 )
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     fill_all_compressed_indices,
@@ -1571,11 +1574,20 @@ class DeepseekV4AttnBackend(
         # HCU runs the paged (page_table + context_lens + schedule) decode indexer
         # on LightOp when it provides every kernel the model needs; otherwise it
         # keeps the slot-based path.
+        if envs.SGLANG_DSV41_HCU_INT8_INDEXER.get():
+            validate_int8_indexer()
         self.use_lightop_paged_indexer: bool = (
             _is_hcu
             and lightop_paged_indexer_available()
             and (candidate_topk_blocks <= 0 or self.candidate_indexer is not None)
         )
+        if (
+            envs.SGLANG_DSV41_HCU_INT8_INDEXER.get()
+            and not self.use_lightop_paged_indexer
+        ):
+            raise RuntimeError(
+                "INT8 Indexer requires the native LightOp paged/candidate path"
+            )
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -3935,6 +3947,15 @@ class DeepseekV4AttnBackend(
             out_loc = core.c2_out_loc
 
         indexer = layer.indexer
+        if (
+            indexer is not None
+            and indexer.owns_k
+            and envs.SGLANG_DSV41_HCU_INT8_INDEXER.get()
+        ):
+            self._store_low_ratio_index_k_int8(
+                pool, layer, latent, pos, out_loc, layer.compress_ratio
+            )
+            return
         if indexer is not None and indexer.owns_k:
             # out_loc is -1 for an incomplete group and 0 for padding;
             # the kernel suppresses both stores.
@@ -4062,6 +4083,41 @@ class DeepseekV4AttnBackend(
         )
         return partner_kv, partner_score
 
+    @staticmethod
+    def _store_low_ratio_index_k_int8(
+        pool, layer, latent, positions, locations, ratio=1
+    ):
+        from lightop.attention import dsv41_indexer_rope_int8
+
+        indexer = layer.indexer
+        # Projection and norm feed RoPE/INT8 directly without FP4 fake quantization.
+        k = indexer.forward_wk(latent).view(-1, 1, 128)
+        dsv41_indexer_rope_int8(
+            k,
+            layer.freqs_cis,
+            positions,
+            cache=pool.get_index_k_with_scale_buffer(layer.layer_id),
+            locations=locations,
+            page_size=64,
+            ratio=ratio,
+            norm_weight=indexer.k_norm.weight.data,
+            epsilon=indexer.k_norm.eps,
+        )
+
+    @staticmethod
+    def _prepare_low_ratio_index_q_int8(indexer, q_lora, x, frequencies, positions):
+        from lightop.attention import dsv41_indexer_rope_int8
+
+        q, _ = indexer.wq_b(q_lora)
+        q = q.view(q.shape[0], indexer.n_local_heads, 128)
+        return dsv41_indexer_rope_int8(
+            q,
+            frequencies,
+            positions,
+            indexer.head_weights_raw(x),
+            indexer.head_weight_scale,
+        )
+
     def _low_ratio_write_group(
         self,
         layer,
@@ -4080,10 +4136,14 @@ class DeepseekV4AttnBackend(
             else normalized_latent
         )
         freqs = layer.freqs_cis[group_pos]
-        # Index keys come from the pre-RoPE latent, so publish them first. Stored
-        # as fp4 (per-32 ue8m0, no hadamard), matching the reference indexer.
+        # Publish Indexer keys from the pre-RoPE latent in the selected cache
+        # format: INT8 with FP32 scales, or the original per-32 ue8m0 FP4.
         if layer.indexer is not None and layer.indexer.owns_k:
-            if (
+            if envs.SGLANG_DSV41_HCU_INT8_INDEXER.get():
+                self._store_low_ratio_index_k_int8(
+                    pool, layer, latent, group_pos, slots
+                )
+            elif (
                 fuse_index_store
                 and latent.is_cuda
                 and _supports_index_k_rope_pack()
@@ -4341,6 +4401,10 @@ class DeepseekV4AttnBackend(
         ):
             self._low_ratio_index_topk_extend(layer, x, q_lora, pos, forward_batch)
         else:
+            if envs.SGLANG_DSV41_HCU_INT8_INDEXER.get():
+                raise RuntimeError(
+                    "INT8 Indexer requires native dense/paged Prefill metadata"
+                )
             self._low_ratio_index_topk_torch(layer, x, q_lora, req, pos)
 
     @staticmethod
@@ -4464,6 +4528,78 @@ class DeepseekV4AttnBackend(
                 budget_bytes=_TORCH_INDEXER_SCORE_BUDGET_BYTES,
             ):
                 return
+        if envs.SGLANG_DSV41_HCU_INT8_INDEXER.get():
+            from lightop import dsv41_mqa_prefill_metadata
+            from lightop.attention import dsv41_gather_index_k_int8
+            from sglang.srt.layers.attention.mqa_logits_utils import (
+                dsv41_mqa_logits_rows_per_chunk,
+            )
+
+            page_indices.fill_(-1)
+            if raw_indices is not None:
+                raw_indices.fill_(-1)
+            cache_metadata = (
+                isinstance(self.forward_metadata, DSV4Metadata)
+                and self.forward_metadata.low_ratio_query_lens is not None
+                and q_lens is self.forward_metadata.low_ratio_query_lens
+            )
+            prepared = (
+                self.forward_metadata.low_ratio_dense_metadata.get(ratio)
+                if cache_metadata
+                else None
+            )
+            if prepared is None:
+                prepared = _LowRatioDenseMetadata(
+                    *dsv41_mqa_prefill_metadata(
+                        forward_batch.seq_lens,
+                        q_lens.to(torch.int32).contiguous(),
+                        pos.to(torch.int64).contiguous(),
+                        forward_batch.req_pool_indices,
+                        self.req_to_token,
+                        ratio,
+                        sum(lc_per_req),
+                        max(max(q_lens_cpu, default=0), max(lc_per_req)),
+                    )
+                )
+                if cache_metadata:
+                    self.forward_metadata.low_ratio_dense_metadata[ratio] = prepared
+            ks, ke, compress_lens, k_slots = (
+                prepared.ks,
+                prepared.ke,
+                prepared.compress_lens,
+                prepared.k_slots,
+            )
+            kv = dsv41_gather_index_k_int8(
+                pool.get_index_k_with_scale_buffer(layer.layer_id), k_slots
+            )
+            q, _, weights = self._prepare_low_ratio_index_q_int8(
+                indexer, q_lora, x, layer.freqs_cis, pos
+            )
+            width = ceil_align(max(lc_per_req), 4)
+            rows_per_chunk = dsv41_mqa_logits_rows_per_chunk(
+                num_rows=num_tokens, num_cols=width, device_index=device.index
+            )
+            rows_per_chunk = min(
+                rows_per_chunk or num_tokens,
+                max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (width * 4)),
+            )
+            return self._low_ratio_index_topk_chunked(
+                indexer,
+                q,
+                kv,
+                weights,
+                ks,
+                ke,
+                compress_lens,
+                k_slots,
+                lc_per_req,
+                q_lens_cpu,
+                page_indices,
+                raw_indices,
+                None,
+                rows_per_chunk,
+                native_int8=True,
+            )
         page_indices.fill_(-1)
         if raw_indices is not None:
             raw_indices.fill_(-1)
@@ -4692,6 +4828,7 @@ class DeepseekV4AttnBackend(
         raw_indices,
         candidate_blocks,
         rows_per_chunk,
+        native_int8=False,
     ) -> None:
         from lightop.attention import dsv41_ragged_topk_postprocess
 
@@ -4764,18 +4901,31 @@ class DeepseekV4AttnBackend(
                 if candidate_blocks is not None
                 else None
             )
-            logits = _hcu_dense_fp4_mqa_logits(
-                (q[rows].contiguous(), None),
-                kv,
-                weights[rows].contiguous(),
-                ks[rows].contiguous(),
-                ke[rows].contiguous(),
-                width,
-                candidate_blocks=blocks,
-                candidate_query_lens=[hi - lo for _, _, _, lo, hi in segments]
-                if blocks is not None
-                else None,
-            )
+            if native_int8:
+                logits = mqa_logits_int8_chunk(
+                    q,
+                    kv,
+                    weights,
+                    compress_lens,
+                    lc_per_req,
+                    segments,
+                    start,
+                    end,
+                    width,
+                )
+            else:
+                logits = _hcu_dense_fp4_mqa_logits(
+                    (q[rows].contiguous(), None),
+                    kv,
+                    weights[rows].contiguous(),
+                    ks[rows].contiguous(),
+                    ke[rows].contiguous(),
+                    width,
+                    candidate_blocks=blocks,
+                    candidate_query_lens=[hi - lo for _, _, _, lo, hi in segments]
+                    if blocks is not None
+                    else None,
+                )
             for request, lc, base, lo, hi in segments:
                 if not lc:
                     continue
@@ -5009,7 +5159,12 @@ class DeepseekV4AttnBackend(
         k_cache = pool.get_index_k_with_scale_buffer(layer.layer_id)
         assert k_cache.dim() == 2
         page_size = metadata.compressed_page_size
-        k_cache = k_cache.view(k_cache.shape[0], page_size, 1, 68)
+        k_cache = k_cache.view(
+            k_cache.shape[0],
+            page_size,
+            1,
+            132 if envs.SGLANG_DSV41_HCU_INT8_INDEXER.get() else 68,
+        )
 
         lens = metadata.compressed_seq_lens
         page_table = metadata.page_table
@@ -5064,7 +5219,7 @@ class DeepseekV4AttnBackend(
         )
         assert metadata is not None, f"no decode indexer metadata for {ratio = }"
 
-        # fp4 query as (payload, scale), kernel layout [bs, 1, n_heads, dim]. The
+        # Query payload and scale use kernel layout [bs, 1, n_heads, dim]. The
         # kernel sums head scores locally, so the indexer heads must be replicated.
         assert indexer.n_local_heads == indexer.n_heads
         fuse_small_ops = getattr(self, "fuse_small_ops", False)
@@ -5086,7 +5241,12 @@ class DeepseekV4AttnBackend(
             and pos.is_contiguous()
             and (fuse_small_ops or not _has_native_hcu_rope_fake_quant())
         )
-        if use_hcu_pack:
+        if envs.SGLANG_DSV41_HCU_INT8_INDEXER.get():
+            q_fp4, q_sf, weights = self._prepare_low_ratio_index_q_int8(
+                indexer, q_lora, x, layer.freqs_cis, pos
+            )
+            q = q_fp4
+        elif use_hcu_pack:
             from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hcu import (
                 index_q_rope_pack_weights_hcu,
             )
@@ -5127,7 +5287,12 @@ class DeepseekV4AttnBackend(
             q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
             weights = indexer.head_weights(x).float()  # [bs, n_local]
         bs = q.shape[0]
-        q_fp4 = q_fp4.view(bs, 1, indexer.n_local_heads, 64)
+        q_fp4 = q_fp4.view(
+            bs,
+            1,
+            indexer.n_local_heads,
+            128 if envs.SGLANG_DSV41_HCU_INT8_INDEXER.get() else 64,
+        )
         q_sf = q_sf.view(bs, 1, indexer.n_local_heads)
 
         k_cache = pool.get_index_k_with_scale_buffer(layer.layer_id)
@@ -5135,8 +5300,11 @@ class DeepseekV4AttnBackend(
         # Index pool page (64 slots); metadata.page_table is expanded to match.
         page_size = metadata.compressed_page_size
         k_cache = k_cache.view(
-            k_cache.shape[0], page_size, 1, 68
-        )  # fp4: 64 payload + 4 scale
+            k_cache.shape[0],
+            page_size,
+            1,
+            132 if envs.SGLANG_DSV41_HCU_INT8_INDEXER.get() else 68,
+        )  # FP4: 64 payload + 4 scales; INT8: 128 payload + one FP32 scale.
 
         page_indices = core.sparse_page_indices(ratio)
         raw_indices = core.sparse_raw_indices(ratio)
@@ -5146,6 +5314,7 @@ class DeepseekV4AttnBackend(
             k_cache,
             weights,
             metadata,
+            native_int8=envs.SGLANG_DSV41_HCU_INT8_INDEXER.get(),
             request_ids=req,  # one per query row; verify rows of a request share one
         )
         candidate_layer = not _every_request_fits()
@@ -5162,17 +5331,28 @@ class DeepseekV4AttnBackend(
                 self.candidate_indexer.publish_decode(inputs, page_indices, raw_indices)
             )
             return
-        logits = deep_gemm_fp4_paged_mqa_logits(
-            (q_fp4, q_sf),
-            k_cache,
-            weights,
-            metadata.compressed_seq_lens,
-            metadata.page_table,
-            metadata.deep_gemm_metadata,
-            metadata.max_compressed_seq_len,
-            table_block_size=metadata.compressed_page_size,
-            rows_per_request=metadata.rows_per_request,
-        )
+        if inputs.native_int8:
+            logits = paged_mqa_logits_int8(
+                inputs.q_fp4,
+                inputs.k_cache,
+                inputs.weights,
+                metadata.compressed_seq_lens,
+                metadata.page_table,
+                metadata.max_compressed_seq_len,
+                metadata.compressed_page_size,
+            )
+        else:
+            logits = deep_gemm_fp4_paged_mqa_logits(
+                (q_fp4, q_sf),
+                k_cache,
+                weights,
+                metadata.compressed_seq_lens,
+                metadata.page_table,
+                metadata.deep_gemm_metadata,
+                metadata.max_compressed_seq_len,
+                table_block_size=metadata.compressed_page_size,
+                rows_per_request=metadata.rows_per_request,
+            )
         # TODO(dark): add bf16 topk
         topk_transform_paged_from_metadata(logits, metadata, page_indices, raw_indices)
 

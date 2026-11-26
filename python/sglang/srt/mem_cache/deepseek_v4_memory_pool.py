@@ -632,6 +632,7 @@ class DeepSeekV4IndexerPool(KVCache):
         use_fp4_indexer: Optional[bool] = None,
         global_page_size: Optional[int] = None,
         packed_fp4_layout: bool = False,
+        direct_int8: bool = False,
     ):
         super().__init__(
             size,
@@ -643,6 +644,14 @@ class DeepSeekV4IndexerPool(KVCache):
             start_layer,
             end_layer,
         )
+        self.direct_int8 = direct_int8
+        if direct_int8:
+            from sglang.kernels.ops.attention.dsv4.lightop_indexer import (
+                validate_int8_indexer,
+            )
+
+            validate_int8_indexer()
+            assert not use_fp4_indexer and index_head_dim == 128 and page_size == 64
         self.index_head_dim = index_head_dim
         self.index_page_size = self.page_size
         self.global_page_size = global_page_size or page_size
@@ -663,7 +672,7 @@ class DeepSeekV4IndexerPool(KVCache):
         # indexer pool. Keep the feature target-only in that case, matching
         # Spark's explicit draft-worker opt-out.
         self.use_int8_index_k_cache = (
-            int8_requested and self.layer_num > 0 and self.size > 0
+            not direct_int8 and int8_requested and self.layer_num > 0 and self.size > 0
         )
         if self.use_int8_index_k_cache:
             validate_int8_index_k_cache(
@@ -675,6 +684,8 @@ class DeepSeekV4IndexerPool(KVCache):
         self._create_buffer()
 
     def get_bytes_per_token(self) -> int:
+        if self.direct_int8:
+            return 132
         return get_dsv4_indexer_bytes_per_token(
             self.index_head_dim, self.use_fp4_indexer
         )
@@ -1867,10 +1878,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 layer_num,
                 device,
                 enable_memory_saver,
-                use_fp4_indexer=True,
+                use_fp4_indexer=not envs.SGLANG_DSV41_HCU_INT8_INDEXER.get(),
+                direct_int8=envs.SGLANG_DSV41_HCU_INT8_INDEXER.get(),
                 global_page_size=global_page_size,
-                # The low-ratio pools go through store_fp4_index_k_cache and
-                # get_index_k_fp4 / get_index_k_dequant, never the aiter c4 kernels.
+                # Low-ratio INT8 uses fused LightOp RoPE/quantization and storage;
+                # FP4 keeps its packed pool instead of the aiter C4 layout.
                 packed_fp4_layout=_is_hcu,
             )
             # The dsv41 low-ratio indexer rounds to nearest even (reference rounding).

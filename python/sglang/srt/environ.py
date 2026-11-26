@@ -1782,6 +1782,9 @@ class Envs:
     # instead of the TF32 one on HCU. LightOp's kernel also accepts fewer rows.
     SGLANG_DSV4_HC_BF16X3_MIN_ROWS = EnvInt(128)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
+    # DSV4.1 low-ratio Indexer: INT8 K cache, Q/K preparation and LightOp scoring.
+    # False keeps the existing FP4 path; enable consistently on P and D.
+    SGLANG_DSV41_HCU_INT8_INDEXER = EnvBool(False)
     # Store the DSV4 C4 indexer K cache as signed INT8 plus one FP32 scale
     # per token on HCU gfx936. The packed page ABI remains 132 bytes/token.
     # Enabling this also requires the native LightOp INT8 Paged MQA consumer;

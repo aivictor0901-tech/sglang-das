@@ -71,17 +71,28 @@ class LightopCandidateIndexer:
     ) -> LightopBlockTable:
         metadata = inputs.metadata
         seq_lens = _int32_lens(metadata.compressed_seq_lens)
-        logits = deep_gemm_fp4_paged_mqa_logits(
-            (inputs.q_fp4, inputs.q_sf),
-            inputs.k_cache,
-            inputs.weights,
-            seq_lens,
-            metadata.page_table,
-            metadata.deep_gemm_metadata,
-            metadata.max_compressed_seq_len,
-            table_block_size=metadata.compressed_page_size,
-            rows_per_request=metadata.rows_per_request,
-        )
+        if inputs.native_int8:
+            logits = lightop_indexer.paged_mqa_logits_int8(
+                inputs.q_fp4,
+                inputs.k_cache,
+                inputs.weights,
+                seq_lens,
+                metadata.page_table,
+                metadata.max_compressed_seq_len,
+                metadata.compressed_page_size,
+            )
+        else:
+            logits = deep_gemm_fp4_paged_mqa_logits(
+                (inputs.q_fp4, inputs.q_sf),
+                inputs.k_cache,
+                inputs.weights,
+                seq_lens,
+                metadata.page_table,
+                metadata.deep_gemm_metadata,
+                metadata.max_compressed_seq_len,
+                table_block_size=metadata.compressed_page_size,
+                rows_per_request=metadata.rows_per_request,
+            )
         main_stream = torch.cuda.current_stream()
         # The block-table chain reads logits and nothing else, so it forks off
         # the dense logits launch and runs beside the layer's own top-k.
@@ -91,7 +102,9 @@ class LightopCandidateIndexer:
         self._dense_topk(logits, seq_lens, metadata, page_indices, raw_indices)
         with torch.cuda.stream(self.alt_stream):
             self.alt_stream.wait_event(producer_ready)
-            table = self._block_table(logits, seq_lens, metadata)
+            table = self._block_table(
+                logits, seq_lens, metadata, native_int8=inputs.native_int8
+            )
             # select_decode reads these on the main stream
             for t in (table.phys_blocks, table.valid_lens, table.schedule):
                 if t is not None:
@@ -119,6 +132,7 @@ class LightopCandidateIndexer:
         logits: torch.Tensor,
         seq_lens: torch.Tensor,
         metadata,
+        native_int8: bool = False,
     ) -> LightopBlockTable:
         phys_blocks, valid_lens = lightop_indexer.candidate_block_table(
             logits,
@@ -129,7 +143,9 @@ class LightopCandidateIndexer:
             self.block_size,
         )
         schedule = None
-        if lightop_indexer.schedule_rows_supported(valid_lens.numel()):
+        if not native_int8 and lightop_indexer.schedule_rows_supported(
+            valid_lens.numel()
+        ):
             # One route per row: select_decode's TB=8 kernel never pairs
             # verify rows. The planner reads valid_lens on device, so a
             # captured graph replans on every replay.
@@ -150,16 +166,27 @@ class LightopCandidateIndexer:
         assert raw_indices is None
         table = candidate_metadata
         assert isinstance(table, LightopBlockTable), type(table)
-        logits = lightop_indexer.paged_mqa_logits_fp4(
-            (inputs.q_fp4, inputs.q_sf),
-            inputs.k_cache,
-            inputs.weights,
-            table.valid_lens,
-            table.phys_blocks,
-            table.schedule,
-            self.topk_blocks * self.block_size,
-            table_block_size=self.block_size,
-        )
+        if inputs.native_int8:
+            logits = lightop_indexer.paged_mqa_logits_int8(
+                inputs.q_fp4,
+                inputs.k_cache,
+                inputs.weights,
+                table.valid_lens,
+                table.phys_blocks,
+                self.topk_blocks * self.block_size,
+                self.block_size,
+            )
+        else:
+            logits = lightop_indexer.paged_mqa_logits_fp4(
+                (inputs.q_fp4, inputs.q_sf),
+                inputs.k_cache,
+                inputs.weights,
+                table.valid_lens,
+                table.phys_blocks,
+                table.schedule,
+                self.topk_blocks * self.block_size,
+                table_block_size=self.block_size,
+            )
         topk_transform_paged(
             logits,
             table.valid_lens,

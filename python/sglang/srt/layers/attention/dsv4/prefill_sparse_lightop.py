@@ -488,7 +488,8 @@ def consume_prefill_candidate_sparse(
     k_cache = pool.get_index_k_with_scale_buffer(layer_id)
     if k_cache is None:
         return False
-    k_cache = k_cache.view(k_cache.shape[0], page_size, 1, 68)
+    native_int8 = envs.SGLANG_DSV41_HCU_INT8_INDEXER.get()
+    k_cache = k_cache.view(k_cache.shape[0], page_size, 1, 132 if native_int8 else 68)
     fused_consumer = _lightop_fused_consumer(x)
     retained = getattr(candidate_metadata, "request_block_ids", None)
     if (
@@ -511,7 +512,10 @@ def consume_prefill_candidate_sparse(
         q, _ = indexer.wq_b(q_lora)
         q = q.view(positions.numel(), indexer.n_local_heads, indexer.index_head_dim)
         fused_consumer(
-            q, raw_weights, freqs_cis, positions,
+            q,
+            raw_weights,
+            freqs_cis,
+            positions,
             weight_scale=indexer.head_weight_scale,
             rope_dim=indexer.rope_head_dim,
             k_cache=k_cache,
@@ -527,8 +531,12 @@ def consume_prefill_candidate_sparse(
             out_page_indices=page_indices,
             out_raw_indices=raw_indices,
             budget_bytes=budget_bytes,
+            **({"native_int8": True} if native_int8 else {}),
         )
         return True
+    if native_int8:
+        # Let the direct INT8 dense/chunked route handle unsupported sparse geometry.
+        return False
     # The original adapter needs -1 for skipped requests and output padding.
     page_indices.fill_(-1)
     if raw_indices is not None:

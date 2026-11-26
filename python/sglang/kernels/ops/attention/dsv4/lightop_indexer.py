@@ -15,6 +15,10 @@ the kernels change:
 
 Every call takes device tensors only and allocates nothing data dependent, so
 the path is graph capturable.
+
+With SGLANG_DSV41_HCU_INT8_INDEXER enabled, the same full-range and candidate
+selectors use INT8 queries and the 132-byte-per-token INT8/FP32-scale K pool.
+The INT8 wrappers below consume those buffers directly without FP4 conversion.
 """
 
 from __future__ import annotations
@@ -80,9 +84,13 @@ def candidate_block_mask(
 
 @functools.cache
 def lightop_paged_indexer_available() -> bool:
-    """True when the paged fp4 decode indexer can run on LightOp: HCU, the flag
-    on, and a LightOp build providing the paged ABI and the candidate table."""
-    if not (_is_hcu and envs.SGLANG_USE_LIGHTOP_DSV41_PAGED_INDEXER.get()):
+    """Check the LightOp kernels required by the selected Indexer cache format."""
+    if not _is_hcu:
+        return False
+    if envs.SGLANG_DSV41_HCU_INT8_INDEXER.get():
+        validate_int8_indexer()
+        return True
+    if not envs.SGLANG_USE_LIGHTOP_DSV41_PAGED_INDEXER.get():
         return False
     mods = _lightop_modules()
     if mods is None:
@@ -130,6 +138,96 @@ def _int32_lens(lens: torch.Tensor) -> torch.Tensor:
     if lens.dtype != torch.int32:
         lens = lens.to(torch.int32)
     return lens.contiguous()
+
+
+@functools.cache
+def validate_int8_indexer() -> None:
+    """Fail at initialization if the requested INT8 cache cannot be consumed."""
+    if not _is_hcu:
+        raise RuntimeError("INT8 Indexer requires HCU LightOp")
+    modules = _lightop_modules()
+    if modules is None:
+        raise RuntimeError("INT8 Indexer requires a LightOp build with INT8 kernels")
+    op, attention = modules
+    for name in (
+        "dsv41_indexer_rope_int8",
+        "dsv41_gather_index_k_int8",
+        "paged_mqa_logits_int8_indexed",
+        "prefill_sparse_native_prepare_query",
+        "dsv41_candidate_block_table",
+    ):
+        if not hasattr(op, name):
+            raise RuntimeError(f"INT8 Indexer requires rebuilt LightOp: {name}")
+    for name in (
+        "dsv41_indexer_rope_int8",
+        "dsv41_gather_index_k_int8",
+        "paged_mqa_logits_int8_indexed",
+        "dsv41_candidate_block_table",
+        "mqa_logits",
+    ):
+        if not hasattr(attention, name):
+            raise RuntimeError(f"INT8 Indexer requires LightOp attention API: {name}")
+    if not getattr(op, "_paged_mqa_logits_int8_supports_clean_logits", False):
+        raise RuntimeError("INT8 Indexer requires LightOp graph live-grid support")
+
+
+def paged_mqa_logits_int8(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    max_context_len: int,
+    table_block_size: int,
+) -> torch.Tensor:
+    """Score persistent INT8 keys directly for full-range or candidate TopK."""
+    from lightop.attention import paged_mqa_logits_int8_indexed
+
+    return paged_mqa_logits_int8_indexed(
+        q,
+        k_cache,
+        weights,
+        _int32_lens(context_lens),
+        block_table,
+        max_context_len,
+        table_block_size,
+        # All callers use length-masked TopK/candidate-block selection.
+        clean_logits=False,
+    )
+
+
+def mqa_logits_int8_chunk(
+    q, kv, weights, lengths, lc_per_req, segments, start, end, width
+):
+    """Score an INT8 Prefill tile while preserving request-local columns.
+
+    K payloads and scales are gathered once without dequantization. The score
+    buffer is bounded by the caller's existing Prefill workspace budget.
+    """
+    from lightop.attention import mqa_logits
+
+    logits = torch.full(
+        (end - start, width), -torch.inf, device=q.device, dtype=torch.float32
+    )
+    k_start = [0]
+    for lc in lc_per_req:
+        k_start.append(k_start[-1] + lc)
+    for request, lc, _, lo, hi in segments:
+        if not lc:
+            continue
+        keys = slice(k_start[request], k_start[request + 1])
+        mqa_logits(
+            q[lo:hi],
+            kv[0][keys],
+            weights[lo:hi],
+            torch.zeros_like(lengths[lo:hi]),
+            lengths[lo:hi].contiguous(),
+            kv_scale=kv[1][keys],
+            clean_logit=True,
+            D_out=logits[lo - start : hi - start],
+            native_int8=True,
+        )
+    return logits
 
 
 # The planner splits rows every 4 * block_kv positions; paged_mqa_logits_fp4

@@ -1232,10 +1232,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             self.cp_draft_layers = len(cfg.hf_text_config.dspark_target_layer_ids)
             assert self.cp_draft_layers > 0, "DSPARK draft layer count is required"
         self.swa_priced_layers = self.num_layers_total
-        # The low-ratio indexer pools are built with force_fp4=True
-        # (deepseek_v4_memory_pool), so they are fp4 whatever dtype c4 uses.
+        # Low-ratio Indexer storage follows its FP4/INT8 switch independently
+        # of the C4 cache dtype; account for payload and scale bytes together.
         self.low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
-            self.indexer_head_dim, use_fp4_indexer=True
+            self.indexer_head_dim,
+            use_fp4_indexer=not envs.SGLANG_DSV41_HCU_INT8_INDEXER.get(),
         )
         if self.use_cp_cache_layer_split:
             from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_layout import (

@@ -315,7 +315,8 @@ class PagedIndexerMetadata:
         from sglang.kernels.ops.attention.dsv4 import lightop_indexer
 
         if (
-            self.compress_ratio not in (1, 2)
+            envs.SGLANG_DSV41_HCU_INT8_INDEXER.get()
+            or self.compress_ratio not in (1, 2)
             or self.row_chunk > 0
             or self.use_prefill_cuda_graph
             or not lightop_indexer.lightop_paged_indexer_available()
